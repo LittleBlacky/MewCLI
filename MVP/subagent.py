@@ -183,7 +183,10 @@ def run_subagent(prompt: str) -> str:
     """
     subgraph = build_subagent_graph()
     # fresh messages=[] 实现上下文隔离
-    final_state = subgraph.invoke({"messages": [HumanMessage(content=prompt)]})
+    final_state = subgraph.invoke(
+        {"messages": [HumanMessage(content=prompt)]},
+        config={"recursion_limit": 80},
+    )
     messages = final_state["messages"]
     # 提取最后一条 AI 消息的文本作为摘要
     for msg in reversed(messages):
@@ -227,7 +230,8 @@ def build_parent_graph():
 
     def parent_node(state: AgentState):
         response = llm.invoke(
-            [{"role": "system", "content": SYSTEM_PARENT}] + state["messages"]
+            [{"role": "system", "content": SYSTEM_PARENT}] + state["messages"],
+            config={"recursion_limit": 200},
         )
         return {"messages": [response]}
 
