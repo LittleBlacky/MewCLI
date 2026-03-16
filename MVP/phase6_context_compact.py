@@ -1,6 +1,5 @@
 #!/usr/bin/env python3
 import os
-import json
 import subprocess
 from typing import TypedDict, List
 from pathlib import Path
@@ -8,7 +7,6 @@ from dotenv import load_dotenv
 
 from langgraph.graph import StateGraph, END
 from langgraph.prebuilt import ToolNode
-
 from langchain.chat_models import init_chat_model
 from langchain.tools import tool
 from langchain_core.messages import (
@@ -17,13 +15,13 @@ from langchain_core.messages import (
     AIMessageChunk,
     SystemMessage,
 )
+from langchain_core.messages.utils import count_tokens_approximately
 
 
 # =====================
 # ENV
 # =====================
 load_dotenv()
-
 os.environ["NO_PROXY"] = "*"
 
 MODEL_ID = os.environ["AGENCY_LLM_MODEL"]
@@ -33,8 +31,8 @@ PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
 
-CONTEXT_LIMIT = 500
-KEEP_LAST_N = 12
+MAX_TOKEN_BEFORE_SUMMARY = 4000  # 总 Token 超过此值触发摘要
+KEEP_RECENT_MESSAGES = 15  # 摘要后保留的最近原始消息数
 
 
 # =====================
@@ -52,8 +50,6 @@ llm = init_chat_model(
 # =====================
 # TOOLS
 # =====================
-
-
 def safe_path(path_str: str) -> Path:
     path = (WORKDIR / path_str).resolve()
     if not path.is_relative_to(WORKDIR):
@@ -100,9 +96,6 @@ def bash(command: str) -> str:
 
 
 TOOLS = [read_file, write_file, bash]
-
-
-# Tool-enabled LLM
 llm_with_tools = llm.bind_tools(TOOLS)
 
 
@@ -118,40 +111,13 @@ class AgentState(TypedDict):
 # =====================
 
 
-def micro_compact_node(state: AgentState):
-    """Keep only recent messages for context control."""
-    messages = state["messages"]
-
-    if len(messages) > KEEP_LAST_N:
-        print(f"截取最近 {KEEP_LAST_N} 条上下文")
-        messages = messages[-KEEP_LAST_N:]
-
-    return {"messages": messages}
-
-
-def should_compact(state: AgentState):
-    """Decide whether to compact context."""
-    size = len(json.dumps([str(m) for m in state["messages"]]))
-    return "compact" if size > CONTEXT_LIMIT else "continue"
-
-
-def summarize_node(state: AgentState):
-    """Summarize conversation when context is too large."""
-
-    messages = state["messages"]
-
-    summary_prompt = [
-        SystemMessage(content="Summarize the conversation for continuation."),
-        HumanMessage(content=str(messages)),
-    ]
-    print("压缩上下文: ")
-    summary = llm.invoke(summary_prompt)
-    print(f"总结内容：{summary}")
-    return {"messages": [HumanMessage(content=f"[SUMMARY]\n{summary.content}")]}
+def pre_process(state: AgentState):
+    """入口节点：不做修改，仅用于路由判断"""
+    return state
 
 
 def agent_node(state: AgentState):
-    """Main reasoning node with tool calling enabled."""
+    """主推理节点，支持工具调用和流式输出"""
     response = None
     for chunk in llm_with_tools.stream(state["messages"]):
         if isinstance(chunk, AIMessageChunk):
@@ -163,19 +129,60 @@ def agent_node(state: AgentState):
                 response = response + chunk
     print()
     if response is None:
-        response = AIMessage(content=response)
+        response = AIMessage(content="")
     return {"messages": [response]}
 
 
+def summarize_node(state: AgentState):
+    """
+    智能摘要节点：
+    - 将早期消息交给LLM总结
+    - 保留最近若干条原始消息，避免丢失细节
+    """
+    messages = state["messages"]
+    # 分离旧消息和需保留的最近消息
+    if len(messages) <= KEEP_RECENT_MESSAGES:
+        return {"messages": messages}
+
+    old_messages = messages[:-KEEP_RECENT_MESSAGES]
+    recent_messages = messages[-KEEP_RECENT_MESSAGES:]
+
+    print("🧠 上下文过长，正在生成摘要...")
+    summary_prompt = [
+        SystemMessage(
+            content="将以下对话历史总结成一段简洁的摘要，保留关键目标、决策和未完成事项。"
+        ),
+        HumanMessage(content=str(old_messages)),
+    ]
+    summary_response = llm.invoke(summary_prompt)
+
+    # 摘要作为系统消息注入，保留最近原始消息
+    summary_msg = SystemMessage(content=f"[对话历史摘要]\n{summary_response.content}")
+    new_messages = [summary_msg] + recent_messages
+
+    print(f"✅ 摘要完成，消息从 {len(messages)} 条压缩为 {len(new_messages)} 条")
+    return {"messages": new_messages}
+
+
 # =====================
-# ROUTER
+# ROUTERS
 # =====================
+
+
+def should_compact(state: AgentState):
+    """使用近似Token计数判断是否需要摘要"""
+    total_tokens = count_tokens_approximately(
+        state["messages"],
+        model=MODEL_ID,
+    )
+    # 调试时可打开下面的打印
+    # print(f"当前Token数: {total_tokens}")
+    return "summarize" if total_tokens > MAX_TOKEN_BEFORE_SUMMARY else "agent"
 
 
 def should_use_tool(state: AgentState):
-    """Check if last message contains tool calls."""
+    """判断最后一条消息是否包含工具调用"""
     last_msg = state["messages"][-1]
-
     if hasattr(last_msg, "tool_calls") and last_msg.tool_calls:
         return "tool"
     return "end"
@@ -184,26 +191,34 @@ def should_use_tool(state: AgentState):
 # =====================
 # GRAPH
 # =====================
-
 builder = StateGraph(AgentState)
 
-builder.add_node("micro_compact", micro_compact_node)
+# 注册节点
+builder.add_node("pre_process", pre_process)
 builder.add_node("summarize", summarize_node)
 builder.add_node("agent", agent_node)
 builder.add_node("tool", ToolNode(TOOLS))
 
-builder.set_entry_point("micro_compact")
+# 入口为 pre_process
+builder.set_entry_point("pre_process")
 
-# context control
+# 上下文控制：根据Token数量决定是否先摘要
 builder.add_conditional_edges(
-    "micro_compact", should_compact, {"compact": "summarize", "continue": "agent"}
+    "pre_process",
+    should_compact,
+    {"summarize": "summarize", "agent": "agent"},
 )
 
-# tool routing
-builder.add_conditional_edges("agent", should_use_tool, {"tool": "tool", "end": END})
+# 工具路由
+builder.add_conditional_edges(
+    "agent",
+    should_use_tool,
+    {"tool": "tool", "end": END},
+)
 
-builder.add_edge("tool", "agent")
+# 摘要后和工具执行后都进入agent
 builder.add_edge("summarize", "agent")
+builder.add_edge("tool", "agent")
 
 graph = builder.compile()
 
@@ -211,8 +226,6 @@ graph = builder.compile()
 # =====================
 # CLI
 # =====================
-
-
 def run():
     state: AgentState = {
         "messages": [
@@ -228,7 +241,9 @@ def run():
 
         if query.strip() in ("q", "exit", ""):
             break
+
         state["messages"].append(HumanMessage(content=query))
+        # 每次输入后调用 graph，自动进行上下文检查
         state = graph.invoke(state)
         print()
 
