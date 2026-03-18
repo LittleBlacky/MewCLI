@@ -11,10 +11,9 @@ import json
 import os
 import re
 import subprocess
-import time
 from fnmatch import fnmatch
 from pathlib import Path
-from typing import Annotated, Optional
+from typing import Annotated
 
 from typing_extensions import TypedDict
 from dotenv import load_dotenv
@@ -40,7 +39,6 @@ API_KEY = os.getenv("AGENCY_LLM_API_KEY")
 PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
-LLM_DIR = WORKDIR / ".mini-agent-cli"
 MODES = ("default", "plan", "auto")
 READ_ONLY_TOOLS = {"read_file"}
 WRITE_TOOLS = {"write_file", "edit_file", "bash"}
@@ -48,12 +46,8 @@ SYSTEM = (
     f"You are a coding agent at {WORKDIR}. Use tools to solve tasks.\n"
     f"Permission modes: default (user approves each write), "
     f"plan (read-only, no writes), auto (reads allowed, writes ask).\n"
-    f"Use set_mode to switch modes. Keep working step by step, "
-    f"and use compact if the conversation gets too long."
+    f"Use set_mode to switch modes."
 )
-CONTEXT_LIMIT, KEEP_RECENT, PERSIST_THRESHOLD, PREVIEW_CHARS = 50000, 3, 30000, 2000
-TRANSCRIPT_DIR = LLM_DIR / "transcripts"
-TOOL_RESULTS_DIR = LLM_DIR / "task_outputs" / "tool-results"
 
 
 # ---------- Bash security validator ----------
@@ -175,30 +169,11 @@ class PermissionManager:
 
 
 # ---------- helpers ----------
-def _size(messages):
-    return len(str(messages))
-
-
 def _safe(p: str) -> Path:
     p = (WORKDIR / p).resolve()
     if not p.is_relative_to(WORKDIR):
         raise ValueError(p)
     return p
-
-
-def _persist(tool_id: str, out: str) -> str:
-    if len(out) <= PERSIST_THRESHOLD:
-        return out
-    TOOL_RESULTS_DIR.mkdir(parents=True, exist_ok=True)
-    f = TOOL_RESULTS_DIR / f"{tool_id}.txt"
-    if not f.exists():
-        f.write_text(out)
-    return (
-        "<persisted-output>\n"
-        f"Full output: {f.relative_to(WORKDIR)}\n"
-        f"Preview:\n{out[:PREVIEW_CHARS]}\n"
-        "</persisted-output>"
-    )
 
 
 # ---------- tools ----------
@@ -259,12 +234,6 @@ def edit_file(path: str, old_text: str, new_text: str) -> str:
 
 
 @tool
-def compact(focus: str = None) -> str:
-    """Summarize earlier conversation so work can continue in a smaller context."""
-    return "Compacting conversation..."
-
-
-@tool
 def set_mode(mode: str) -> str:
     """Switch permission mode. Valid modes: default, plan, auto."""
     if mode not in MODES:
@@ -272,7 +241,7 @@ def set_mode(mode: str) -> str:
     return f"Switched to {mode} mode"
 
 
-ALL_TOOLS = [bash, read_file, write_file, edit_file, compact, set_mode]
+ALL_TOOLS = [bash, read_file, write_file, edit_file, set_mode]
 TOOL_BY_NAME = {t.name: t for t in ALL_TOOLS}
 
 
@@ -280,85 +249,15 @@ TOOL_BY_NAME = {t.name: t for t in ALL_TOOLS}
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     mode: str
-    permission_rules: list  # list[dict]
+    permission_rules: list
     consecutive_denials: int
-    has_compacted: bool
-    last_summary: str
-    recent_files: list[str]
-    compact_requested: bool
-    compact_focus: Optional[str]
 
 
-# ---------- compact logic ----------
+# ---------- LangGraph nodes ----------
 def _model():
     return init_chat_model(
         model=MODEL_ID, model_provider=PROVIDER, base_url=BASE_URL, api_key=API_KEY
     )
-
-
-def _compact_summary(messages):
-    conv = json.dumps([m.dict() for m in messages])[:80000]
-    prompt = (
-        "Summarize this coding-agent conversation so work can continue.\n"
-        "Preserve: 1. Goal 2. Findings/decisions 3. Files read/changed "
-        "4. Remaining work 5. User constraints.\n\n"
-        f"{conv}"
-    )
-    accumulated = None
-    for chunk in _model().stream([HumanMessage(content=prompt)]):
-        if accumulated is None:
-            accumulated = chunk
-        else:
-            accumulated += chunk
-    return (accumulated.content if accumulated else "").strip()
-
-
-def _compact_history(messages: list, state: AgentState, focus: str = None) -> list:
-    path = TRANSCRIPT_DIR / f"transcript_{int(time.time())}.jsonl"
-    TRANSCRIPT_DIR.mkdir(exist_ok=True)
-    with path.open("w") as h:
-        for m in messages:
-            h.write(json.dumps(m.dict(), default=str) + "\n")
-    print(f"[transcript saved: {path}]")
-    summary = _compact_summary(messages)
-    if focus:
-        summary += f"\nFocus: {focus}"
-    if state.get("recent_files"):
-        summary += "\nRecent files:\n" + "\n".join(
-            f"- {p}" for p in state["recent_files"]
-        )
-    state["has_compacted"] = True
-    state["last_summary"] = summary
-    return [HumanMessage(content="Compacted conversation:\n" + summary)]
-
-
-def _brief(content: str) -> str:
-    first_line = content.strip().split("\n", 1)[0][:80]
-    return f"[compacted] {first_line}"
-
-
-def _micro_compact(messages):
-    tools = [i for i, m in enumerate(messages) if isinstance(m, ToolMessage)]
-    if len(tools) <= KEEP_RECENT:
-        return messages
-    for i in tools[:-KEEP_RECENT]:
-        msg = messages[i]
-        if isinstance(msg.content, str) and len(msg.content) > 120:
-            messages[i] = ToolMessage(
-                content=_brief(msg.content), tool_call_id=msg.tool_call_id
-            )
-    return messages
-
-
-# ---------- LangGraph nodes ----------
-def pre_model(state: AgentState) -> dict:
-    msgs = state["messages"]
-    _micro_compact(msgs)
-    if _size(msgs) > CONTEXT_LIMIT:
-        print("[auto compact]")
-        new_msgs = _compact_history(msgs, state)
-        msgs[:] = new_msgs
-    return {}
 
 
 model = _model().bind_tools(ALL_TOOLS)
@@ -391,10 +290,6 @@ def tools_wrapper(state: AgentState) -> dict:
         mode=state.get("mode", "default"),
         rules=list(state.get("permission_rules", DEFAULT_RULES)),
     )
-
-    recent_files = list(state.get("recent_files", []))
-    compact_requested = False
-    compact_focus = None
 
     final_msgs = []
     for tc in last_ai.tool_calls:
@@ -430,23 +325,7 @@ def tools_wrapper(state: AgentState) -> dict:
 
         print(f"> {name}: {str(content)[:200]}")
 
-        # -- Post-process --
-        if name in {"bash", "read_file"}:
-            content = _persist(tid, content)
-
-        if name == "read_file" and "Error:" not in content:
-            path = args.get("path", "")
-            if path:
-                if path in recent_files:
-                    recent_files.remove(path)
-                recent_files.append(path)
-                if len(recent_files) > 5:
-                    recent_files = recent_files[-5:]
-
-        if name == "compact":
-            compact_requested = True
-            compact_focus = args.get("focus")
-
+        # handle set_mode
         if name == "set_mode":
             new_mode = args.get("mode", "")
             if new_mode in MODES:
@@ -454,27 +333,12 @@ def tools_wrapper(state: AgentState) -> dict:
 
         final_msgs.append(ToolMessage(content=content, tool_call_id=tid))
 
-    # Sync permission state back
-    state["permission_rules"] = perms.rules
-    state["consecutive_denials"] = perms.consecutive_denials
-
     return {
         "messages": final_msgs,
         "mode": perms.mode,
         "permission_rules": perms.rules,
         "consecutive_denials": perms.consecutive_denials,
-        "recent_files": recent_files,
-        "compact_requested": compact_requested,
-        "compact_focus": compact_focus,
     }
-
-
-def compact_node(state: AgentState) -> dict:
-    print("[manual compact]")
-    focus = state.get("compact_focus")
-    new_msgs = _compact_history(state["messages"], state, focus)
-    state["messages"][:] = new_msgs
-    return {"compact_requested": False}
 
 
 def route_agent(state: AgentState) -> str:
@@ -482,24 +346,14 @@ def route_agent(state: AgentState) -> str:
     return "tools" if getattr(last, "tool_calls", None) else END
 
 
-def route_tools(state: AgentState) -> str:
-    return "compact" if state.get("compact_requested") else "pre_model"
-
-
 # ---------- build graph ----------
 graph = StateGraph(AgentState)
-graph.add_node("pre_model", pre_model)
 graph.add_node("agent", agent)
 graph.add_node("tools", tools_wrapper)
-graph.add_node("compact", compact_node)
 
-graph.set_entry_point("pre_model")
-graph.add_edge("pre_model", "agent")
+graph.set_entry_point("agent")
 graph.add_conditional_edges("agent", route_agent, {"tools": "tools", END: END})
-graph.add_conditional_edges(
-    "tools", route_tools, {"compact": "compact", "pre_model": "pre_model"}
-)
-graph.add_edge("compact", "agent")
+graph.add_edge("tools", "agent")
 app = graph.compile()
 
 if __name__ == "__main__":
@@ -515,11 +369,6 @@ if __name__ == "__main__":
         "mode": mode_input,
         "permission_rules": list(DEFAULT_RULES),
         "consecutive_denials": 0,
-        "has_compacted": False,
-        "last_summary": "",
-        "recent_files": [],
-        "compact_requested": False,
-        "compact_focus": None,
     }
 
     while (q := input("\033[36ms07 >> \033[0m")) not in ("q", "exit", ""):
