@@ -89,76 +89,52 @@ DEFAULT_RULES = [
 ]
 
 
-class PermissionManager:
-    """Pipeline: deny_rules → mode_check → allow_rules → ask (via interrupt)"""
-
-    def __init__(self, mode: str = "default", rules: list = None):
-        if mode not in MODES:
-            raise ValueError(f"Unknown mode: {mode}. Choose from {MODES}")
-        self.mode = mode
-        self.rules = rules or list(DEFAULT_RULES)
-        self.consecutive_denials = 0
-        self.max_consecutive_denials = 3
-
-    def check(self, tool_name: str, tool_input: dict) -> dict:
-        """Returns {"behavior": "allow"|"deny"|"ask", "reason": str}"""
-        # Step 0: Bash security validation
-        if tool_name == "bash":
-            command = tool_input.get("command", "")
-            failures = bash_validator.validate(command)
-            if failures:
-                severe = {"sudo", "rm_rf"}
-                severe_hits = [f for f in failures if f[0] in severe]
-                desc = bash_validator.describe_failures(command)
-                if severe_hits:
-                    return {"behavior": "deny", "reason": f"Bash: {desc}"}
-                return {"behavior": "ask", "reason": f"Bash flagged: {desc}"}
-        # Step 1: Deny rules (always checked first)
-        for rule in self.rules:
-            if rule["behavior"] != "deny":
-                continue
-            if self._matches(rule, tool_name, tool_input):
-                return {"behavior": "deny", "reason": f"Blocked by rule: {rule}"}
-        # Step 2: Mode-based decisions
-        if self.mode == "plan":
-            if tool_name in WRITE_TOOLS:
-                return {"behavior": "deny", "reason": "Plan mode: writes blocked"}
-            return {"behavior": "allow", "reason": "Plan mode: read allowed"}
-        if self.mode == "auto":
-            if tool_name in READ_ONLY_TOOLS:
-                return {"behavior": "allow", "reason": "Auto mode: read approved"}
-        # Step 3: Allow rules
-        for rule in self.rules:
-            if rule["behavior"] != "allow":
-                continue
-            if self._matches(rule, tool_name, tool_input):
-                self.consecutive_denials = 0
-                return {"behavior": "allow", "reason": f"Matched rule: {rule}"}
-        # Step 4: Ask user (via LangGraph interrupt)
-        return {"behavior": "ask", "reason": f"No rule for {tool_name}, asking user"}
-
-    def add_rule(self, tool_name: str):
-        """Add a permanent allow rule for a tool."""
-        self.rules.append({"tool": tool_name, "path": "*", "behavior": "allow"})
-        self.consecutive_denials = 0
-
-    def record_denial(self):
-        self.consecutive_denials += 1
-        if self.consecutive_denials >= self.max_consecutive_denials:
-            print(f"  [{self.consecutive_denials} denials — consider /mode plan]")
-
-    def _matches(self, rule: dict, tool_name: str, tool_input: dict) -> bool:
-        if rule.get("tool") and rule["tool"] != "*" and rule["tool"] != tool_name:
+def _match_rule(rule: dict, tool_name: str, tool_input: dict) -> bool:
+    """Check if a permission rule matches the tool call."""
+    if rule.get("tool") and rule["tool"] != "*" and rule["tool"] != tool_name:
+        return False
+    if "path" in rule and rule["path"] != "*":
+        path = tool_input.get("path", "")
+        if not fnmatch(path, rule["path"]):
             return False
-        if "path" in rule and rule["path"] != "*":
-            path = tool_input.get("path", "")
-            if not fnmatch(path, rule["path"]):
-                return False
-        if "content" in rule:
-            command = tool_input.get("command", "")
-            if not fnmatch(command, rule["content"]):
-                return False
-        return True
+    if "content" in rule:
+        command = tool_input.get("command", "")
+        if not fnmatch(command, rule["content"]):
+            return False
+    return True
+
+
+def _check_permission(mode: str, rules: list, tool_name: str, args: dict) -> dict:
+    """Pipeline: bash_validator → deny_rules → mode → allow_rules.
+    Returns {"behavior": "allow"|"deny"|"ask", "reason": str}"""
+    # Step 0: Bash security
+    if tool_name == "bash":
+        command = args.get("command", "")
+        failures = bash_validator.validate(command)
+        if failures:
+            severe = {"sudo", "rm_rf"}
+            severe_hits = [f for f in failures if f[0] in severe]
+            desc = bash_validator.describe_failures(command)
+            if severe_hits:
+                return {"behavior": "deny", "reason": f"Bash: {desc}"}
+            return {"behavior": "ask", "reason": f"Bash flagged: {desc}"}
+    # Step 1: Deny rules
+    for rule in rules:
+        if rule["behavior"] == "deny" and _match_rule(rule, tool_name, args):
+            return {"behavior": "deny", "reason": f"Blocked by rule: {rule}"}
+    # Step 2: Mode
+    if mode == "plan":
+        if tool_name in WRITE_TOOLS:
+            return {"behavior": "deny", "reason": "Plan mode: writes blocked"}
+        return {"behavior": "allow", "reason": "Plan mode: read allowed"}
+    if mode == "auto" and tool_name in READ_ONLY_TOOLS:
+        return {"behavior": "allow", "reason": "Auto mode: read approved"}
+    # Step 3: Allow rules
+    for rule in rules:
+        if rule["behavior"] == "allow" and _match_rule(rule, tool_name, args):
+            return {"behavior": "allow", "reason": f"Matched rule: {rule}"}
+    # Step 4: Ask
+    return {"behavior": "ask", "reason": f"No rule for {tool_name}"}
 
 
 # ---------- helpers ----------
@@ -274,51 +250,44 @@ def agent(state: AgentState) -> dict:
 
 
 def tools_wrapper(state: AgentState) -> dict:
-    """
-    Permission-aware tool execution with LangGraph interrupt().
-    Pipeline: deny_rules → mode_check → allow_rules → interrupt (was ask_user)
-    """
+    """Permission-aware tool execution. deny → mode → allow → interrupt."""
     last_ai = state["messages"][-1]
-    perms = PermissionManager(
-        mode=state.get("mode", "default"),
-        rules=list(state.get("permission_rules", DEFAULT_RULES)),
-    )
+    mode = state.get("mode", "default")
+    rules = list(state.get("permission_rules", DEFAULT_RULES))
+    consec = state.get("consecutive_denials", 0)
+
+    def deny(reason: str) -> ToolMessage:
+        nonlocal consec
+        print(f"  [DENIED] {reason}")
+        consec += 1
+        if consec >= 3:
+            print(f"  [{consec} denials — consider /mode plan]")
+        return ToolMessage(content=f"Permission denied: {reason}", tool_call_id=tid)
 
     final_msgs = []
     for tc in last_ai.tool_calls:
-        name = tc["name"]
-        tid = tc["id"]
-        args = tc.get("args", {}) or {}
+        name, tid, args = tc["name"], tc["id"], tc.get("args", {}) or {}
 
-        # -- Permission check --
-        decision = perms.check(name, args)
+        decision = _check_permission(mode, rules, name, args)
 
         if decision["behavior"] == "deny":
-            content = f"Permission denied: {decision['reason']}"
-            print(f"  [DENIED] {name}: {decision['reason']}")
-            perms.record_denial()
-            final_msgs.append(ToolMessage(content=content, tool_call_id=tid))
+            final_msgs.append(deny(decision["reason"]))
             continue
 
         if decision["behavior"] == "ask":
-            # Use LangGraph interrupt() instead of blocking input()
             preview = json.dumps(args, ensure_ascii=False)[:200]
             user_choice = interrupt(
                 f"[Permission] {name}: {preview}\n  Allow? (y/n/always): "
             )
-            # user_choice is a dict: {"approved": bool, "add_rule": bool}
             if not user_choice.get("approved"):
-                content = f"Permission denied by user for {name}"
-                print(f"  [USER DENIED] {name}")
-                perms.record_denial()
-                final_msgs.append(ToolMessage(content=content, tool_call_id=tid))
+                final_msgs.append(deny(f"by user for {name}"))
                 continue
             if user_choice.get("add_rule"):
-                perms.add_rule(name)
+                rules.append({"tool": name, "path": "*", "behavior": "allow"})
                 print(f"  [Rule added: always allow {name}]")
-            perms.consecutive_denials = 0
+            consec = 0
 
-        # -- Execute tool --
+        # Execute
         tool_fn = TOOL_BY_NAME.get(name)
         if tool_fn:
             try:
@@ -327,7 +296,6 @@ def tools_wrapper(state: AgentState) -> dict:
                 content = f"Error: {e}"
         else:
             content = f"Unknown tool: {name}"
-
         print(f"> {name}: {str(content)[:200]}")
 
         if name == "set_mode":
@@ -339,9 +307,9 @@ def tools_wrapper(state: AgentState) -> dict:
 
     return {
         "messages": final_msgs,
-        "mode": perms.mode,
-        "permission_rules": perms.rules,
-        "consecutive_denials": perms.consecutive_denials,
+        "mode": mode,
+        "permission_rules": rules,
+        "consecutive_denials": consec,
     }
 
 
