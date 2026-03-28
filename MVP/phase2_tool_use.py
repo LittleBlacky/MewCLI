@@ -88,7 +88,7 @@ def bash_tool(command: str) -> str:
     if any(d in command for d in dangerous):
         return "[Error]: Dangerous command blocked"
     try:
-        subprocess.run(
+        r = subprocess.run(
             command,
             shell=True,
             cwd=WORKDIR,
@@ -99,7 +99,7 @@ def bash_tool(command: str) -> str:
         out = (r.stdout + r.stderr).strip()
         return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
-        return f"[Error]: Timeout (120s)"
+        return "[Error]: Timeout (120s)"
 
 
 tools = [bash_tool, read_file, write_file, edit_file]
