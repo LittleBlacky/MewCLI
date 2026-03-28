@@ -36,7 +36,7 @@ PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
 LLM_DIR = WORKDIR / ".mini-agent-cli"
-TEAM_DIR = LLM_DIR / "team"
+TEAM_DIR = LLM_DIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
 
 model = init_chat_model(

@@ -35,7 +35,8 @@ API_KEY = os.getenv("AGENCY_LLM_API_KEY")
 PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
-RUNTIME_DIR = WORKDIR / ".runtime-tasks"
+LLM_DIR = WORKDIR / ".mini-agent-cli"
+RUNTIME_DIR = LLM_DIR / ".runtime-tasks"
 RUNTIME_DIR.mkdir(exist_ok=True)
 
 model = init_chat_model(

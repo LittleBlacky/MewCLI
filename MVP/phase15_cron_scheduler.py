@@ -49,8 +49,9 @@ API_KEY = os.getenv("AGENCY_LLM_API_KEY")
 PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
-SCHEDULED_TASKS_FILE = WORKDIR / ".claude" / "scheduled_tasks.json"
-CRON_LOCK_FILE = WORKDIR / ".claude" / "cron.lock"
+LLM_DIR = WORKDIR / ".mini-agent-cli"
+SCHEDULED_TASKS_FILE = LLM_DIR / "scheduled_tasks.json"
+CRON_LOCK_FILE = LLM_DIR / "cron.lock"
 AUTO_EXPIRY_DAYS = 7
 JITTER_MINUTES = [0, 30]
 JITTER_OFFSET_MAX = 4
