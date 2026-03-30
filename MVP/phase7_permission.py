@@ -256,13 +256,13 @@ def tools_wrapper(state: AgentState) -> dict:
     rules = list(state.get("permission_rules", DEFAULT_RULES))
     consec = state.get("consecutive_denials", 0)
 
-    def deny(reason: str) -> ToolMessage:
+    def deny(reason: str, tool_call_id: str) -> ToolMessage:
         nonlocal consec
         print(f"  [DENIED] {reason}")
         consec += 1
         if consec >= 3:
             print(f"  [{consec} denials — consider /mode plan]")
-        return ToolMessage(content=f"Permission denied: {reason}", tool_call_id=tid)
+        return ToolMessage(content=f"Permission denied: {reason}", tool_call_id=tool_call_id)
 
     final_msgs = []
     for tc in last_ai.tool_calls:
@@ -271,7 +271,7 @@ def tools_wrapper(state: AgentState) -> dict:
         decision = _check_permission(mode, rules, name, args)
 
         if decision["behavior"] == "deny":
-            final_msgs.append(deny(decision["reason"]))
+            final_msgs.append(deny(decision["reason"], tid))
             continue
 
         if decision["behavior"] == "ask":
@@ -280,7 +280,7 @@ def tools_wrapper(state: AgentState) -> dict:
                 f"[Permission] {name}: {preview}\n  Allow? (y/n/always): "
             )
             if not user_choice.get("approved"):
-                final_msgs.append(deny(f"by user for {name}"))
+                final_msgs.append(deny(f"by user for {name}", tid))
                 continue
             if user_choice.get("add_rule"):
                 rules.append({"tool": name, "path": "*", "behavior": "allow"})
