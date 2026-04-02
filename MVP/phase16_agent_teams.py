@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 phase16_agent_teams.py - Agent Teams
 
@@ -6,8 +7,21 @@ Persistent named agents with file-based JSONL inboxes. Each teammate runs
 its own agent loop in a separate thread. Communication happens through
 append-only inbox files.
 
-Subagent (phase4):    spawn -> execute -> return summary -> destroyed
-Teammate (phase16):  spawn -> work -> idle -> work -> ... -> shutdown
+Key insight: "Teammates have names, inboxes, and independent loops."
+
+    .team/config.json                   .team/inbox/
+    +----------------------------+      +------------------+
+    | {"team_name": "default",   |      | alice.jsonl      |
+    |  "members": [              |      | bob.jsonl        |
+    |    {"name":"alice",        |      | lead.jsonl       |
+    |     "role":"coder",        |      +------------------+
+    |     "status":"idle"}       |
+    |  ]}                        |
+
+LangGraph concepts:
+- Use MessageBus for inter-agent communication via JSONL inboxes
+- TeammateManager for persistent named agents with thread-based execution
+- spawn_teammate creates independent worker loops
 """
 import json
 import os
@@ -35,8 +49,7 @@ API_KEY = os.getenv("AGENCY_LLM_API_KEY")
 PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
-LLM_DIR = WORKDIR / ".mini-agent-cli"
-TEAM_DIR = LLM_DIR / ".team"
+TEAM_DIR = WORKDIR / ".team"
 INBOX_DIR = TEAM_DIR / "inbox"
 
 model = init_chat_model(
@@ -58,8 +71,10 @@ VALID_MSG_TYPES = {
 }
 
 
+# ========== MessageBus ==========
+
 class MessageBus:
-    """JSONL inbox per teammate."""
+    """JSONL inbox per teammate for inter-agent communication."""
 
     def __init__(self, inbox_dir: Path):
         self.dir = inbox_dir
@@ -74,7 +89,7 @@ class MessageBus:
         extra: dict = None,
     ) -> str:
         if msg_type not in VALID_MSG_TYPES:
-            return f"Error: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
+            return f"[Error]: Invalid type '{msg_type}'. Valid: {VALID_MSG_TYPES}"
         msg = {
             "type": msg_type,
             "from": sender,
@@ -111,12 +126,14 @@ class MessageBus:
 BUS = MessageBus(INBOX_DIR)
 
 
+# ========== TeammateManager ==========
+
 class TeammateManager:
     """Persistent teammate registry plus worker-loop launcher."""
 
     def __init__(self, team_dir: Path):
         self.dir = team_dir
-        self.dir.mkdir(exist_ok=True)
+        self.dir.mkdir(parents=True, exist_ok=True)
         self.config_path = self.dir / "config.json"
         self.config = self._load_config()
         self.threads = {}
@@ -139,7 +156,7 @@ class TeammateManager:
         member = self._find_member(name)
         if member:
             if member["status"] not in ("idle", "shutdown"):
-                return f"Error: '{name}' is currently {member['status']}"
+                return f"[Error]: '{name}' is currently {member['status']}"
             member["status"] = "working"
             member["role"] = role
         else:
@@ -156,14 +173,7 @@ class TeammateManager:
         return f"Spawned '{name}' (role: {role})"
 
     def _teammate_loop(self, name: str, role: str, prompt: str):
-        teammate_model = init_chat_model(
-            MODEL_ID,
-            model_provider=PROVIDER,
-            temperature=0,
-            max_tokens=8000,
-            base_url=BASE_URL,
-            api_key=API_KEY,
-        )
+        """Run a teammate's agent loop with inbox communication."""
         sys_prompt = (
             f"You are '{name}', role: {role}, at {WORKDIR}. "
             f"Use send_message to communicate. Complete your task."
@@ -175,20 +185,29 @@ class TeammateManager:
             inbox = BUS.read_inbox(name)
             for msg in inbox:
                 messages.append({"role": "user", "content": json.dumps(msg)})
+
             try:
-                response = teammate_model.bind_tools(tools).invoke(messages)
-            except Exception:
+                response = model_with_tools.invoke(
+                    [SystemMessage(content=sys_prompt)] + [
+                        HumanMessage(content=m["content"]) if m["role"] == "user"
+                        else AIMessage(content=m.get("content", ""))
+                        for m in messages
+                    ]
+                )
+            except Exception as e:
+                print(f"[{name}] Error: {e}")
                 break
+
             messages.append({"role": "assistant", "content": response.content})
-            if hasattr(response, "tool_calls") and response.tool_calls:
-                results = []
-                for tc in response.tool_calls:
-                    output = self._exec(name, tc["name"], tc["args"])
-                    print(f"  [{name}] {tc['name']}: {str(output)[:120]}")
-                    results.append({"role": "tool", "content": output})
-                messages.append({"role": "user", "content": results})
-            else:
+            if hasattr(response, 'tool_calls') and not response.tool_calls:
                 break
+
+            results = []
+            for tc in (response.tool_calls or []):
+                output = self._exec(name, tc["name"], tc.get("args", {}) or {})
+                print(f"  [{name}] {tc['name']}: {str(output)[:120]}")
+                results.append({"type": "tool_result", "tool_call_id": tc.get("id", ""), "content": str(output)})
+            messages.append({"role": "user", "content": results})
 
         member = self._find_member(name)
         if member and member["status"] != "shutdown":
@@ -214,64 +233,12 @@ class TeammateManager:
 
     def _teammate_tools(self) -> list:
         return [
-            {
-                "name": "bash",
-                "description": "Run a shell command.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"command": {"type": "string"}},
-                    "required": ["command"],
-                },
-            },
-            {
-                "name": "read_file",
-                "description": "Read file contents.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}},
-                    "required": ["path"],
-                },
-            },
-            {
-                "name": "write_file",
-                "description": "Write content to a file.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {"path": {"type": "string"}, "content": {"type": "string"}},
-                    "required": ["path", "content"],
-                },
-            },
-            {
-                "name": "edit_file",
-                "description": "Replace exact text in a file.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "path": {"type": "string"},
-                        "old_text": {"type": "string"},
-                        "new_text": {"type": "string"},
-                    },
-                    "required": ["path", "old_text", "new_text"],
-                },
-            },
-            {
-                "name": "send_message",
-                "description": "Send message to a teammate.",
-                "input_schema": {
-                    "type": "object",
-                    "properties": {
-                        "to": {"type": "string"},
-                        "content": {"type": "string"},
-                        "msg_type": {"type": "string"},
-                    },
-                    "required": ["to", "content"],
-                },
-            },
-            {
-                "name": "read_inbox",
-                "description": "Read and drain your inbox.",
-                "input_schema": {"type": "object", "properties": {}},
-            },
+            {"name": "bash", "description": "Run a shell command.", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+            {"name": "read_file", "description": "Read file contents.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+            {"name": "write_file", "description": "Write content to a file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+            {"name": "edit_file", "description": "Replace exact text in a file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+            {"name": "send_message", "description": "Send message to a teammate.", "input_schema": {"type": "object", "properties": {"to": {"type": "string"}, "content": {"type": "string"}, "msg_type": {"type": "string", "enum": list(VALID_MSG_TYPES)}}, "required": ["to", "content"]}},
+            {"name": "read_inbox", "description": "Read and drain your inbox.", "input_schema": {"type": "object", "properties": {}}},
         ]
 
     def list_all(self) -> str:
@@ -289,11 +256,13 @@ class TeammateManager:
 TEAM = TeammateManager(TEAM_DIR)
 
 
-def _safe(p: str) -> Path:
-    p = (WORKDIR / p).resolve()
-    if not p.is_relative_to(WORKDIR):
-        raise ValueError(p)
-    return p
+# ========== Base Tool Implementations ==========
+
+def _safe_path(p: str) -> Path:
+    path = (WORKDIR / p).resolve()
+    if not path.is_relative_to(WORKDIR):
+        raise ValueError(f"Path escapes workspace: {p}")
+    return path
 
 
 def _run_bash(command: str) -> str:
@@ -301,27 +270,26 @@ def _run_bash(command: str) -> str:
     if any(d in command for d in dangerous):
         return "[Error]: Dangerous command blocked"
     try:
-        r = subprocess.run(
-            command, shell=True, cwd=WORKDIR, capture_output=True, text=True, timeout=120
-        )
+        r = subprocess.run(command, shell=True, cwd=WORKDIR, capture_output=True, text=True, timeout=120)
+        out = (r.stdout + r.stderr).strip()
+        return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "[Error]: Timeout (120s)"
-    return (r.stdout + r.stderr).strip() or "(no output)"
 
 
 def _run_read(path: str, limit: int = None) -> str:
     try:
-        lines = _safe(path).read_text().splitlines()
+        lines = _safe_path(path).read_text().splitlines()
         if limit and limit < len(lines):
             lines = lines[:limit] + [f"... ({len(lines) - limit} more)"]
-        return "\n".join(lines)
+        return "\n".join(lines)[:50000]
     except Exception as e:
         return f"[Error]: {e}"
 
 
 def _run_write(path: str, content: str) -> str:
     try:
-        fp = _safe(path)
+        fp = _safe_path(path)
         fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
         return f"Wrote {len(content)} bytes"
@@ -331,7 +299,7 @@ def _run_write(path: str, content: str) -> str:
 
 def _run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
-        fp = _safe(path)
+        fp = _safe_path(path)
         c = fp.read_text()
         if old_text not in c:
             return f"[Error]: Text not found in {path}"
@@ -341,8 +309,16 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
         return f"[Error]: {e}"
 
 
+# ========== Agent State ==========
+
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
+
+
+# ========== Tool Functions ==========
+
 @tool
-def bash(command: str) -> str:
+def bash_tool(command: str) -> str:
     """Run a shell command."""
     return _run_bash(command)
 
@@ -361,7 +337,7 @@ def write_file(path: str, content: str) -> str:
 
 @tool
 def edit_file(path: str, old_text: str, new_text: str) -> str:
-    """Replace exact text in a file once."""
+    """Replace exact text in a file."""
     return _run_edit(path, old_text, new_text)
 
 
@@ -395,70 +371,94 @@ def broadcast(content: str) -> str:
     return BUS.broadcast("lead", content, TEAM.member_names())
 
 
-ALL_TOOLS = [
-    bash, read_file, write_file, edit_file,
-    spawn_teammate, list_teammates, send_message, read_inbox, broadcast
-]
-tool_node = ToolNode(ALL_TOOLS, handle_tool_errors=True)
-model_with_tools = model.bind_tools(ALL_TOOLS)
+# Define tool list and tool node
+agent_tools = [bash_tool, read_file, write_file, edit_file, spawn_teammate, list_teammates, send_message, read_inbox, broadcast]
+tool_node = ToolNode(agent_tools, handle_tool_errors=True)
+model_with_tools = model.bind_tools(agent_tools)
 
 
-class AgentState(TypedDict):
-    messages: Annotated[list, add_messages]
+# ========== Graph Nodes ==========
 
+SYSTEM_PROMPT = f"""You are a team lead at {WORKDIR}. Spawn teammates and communicate via inboxes.
 
-SYSTEM = f"You are a team lead at {WORKDIR}. Spawn teammates and communicate via inboxes."
+Available team operations:
+- spawn_teammate(name, role, prompt): Create a persistent teammate
+- list_teammates(): Show all team members
+- send_message(to, content): Send a message to a teammate
+- read_inbox(): Check your inbox
+- broadcast(content): Send to all teammates
+
+Teammates have independent loops and communicate through JSONL inboxes.
+"""
 
 
 def call_model(state: AgentState) -> dict:
-    """Stream model responses with inbox injection."""
+    """Call the model with current messages."""
+    messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+
+    # Check for incoming messages
     inbox = BUS.read_inbox("lead")
-    messages_with_system = [SystemMessage(content=SYSTEM)] + state["messages"]
     if inbox:
-        messages_with_system.append(
-            HumanMessage(content=f"<inbox>{json.dumps(inbox, indent=2)}</inbox>")
-        )
-    response = model_with_tools.invoke(messages_with_system)
+        messages.append(HumanMessage(content=f"<inbox>{json.dumps(inbox, indent=2)}</inbox>"))
+
+    response = model_with_tools.invoke(messages)
     return {"messages": [response]}
 
 
 def should_continue(state: AgentState) -> Literal["tools", END]:
-    """Decide whether to continue tool execution or finish."""
+    """Check if there are tool calls to execute."""
     last_message = state["messages"][-1]
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tools"
     return END
 
 
+# Build the graph
 workflow = StateGraph(AgentState)
 workflow.add_node("agent", call_model)
 workflow.add_node("tools", tool_node)
 
 workflow.add_edge(START, "agent")
-workflow.add_conditional_edges("agent", should_continue)
 workflow.add_edge("tools", "agent")
+workflow.add_conditional_edges(
+    "agent",
+    should_continue,
+    {"tools": "tools", END: END}
+)
 
 graph = workflow.compile()
 
 
+def run_agent(query: str):
+    """Run the agent with a query."""
+    initial_state = {"messages": [HumanMessage(content=query)]}
+
+    for event in graph.stream(initial_state):
+        node_name = list(event.keys())[0]
+        if node_name == "agent":
+            response = event[node_name]["messages"][-1]
+            if hasattr(response, 'content') and response.content:
+                print(f"\nAssistant: {response.content}")
+        elif node_name == "tools":
+            pass
+
+
 if __name__ == "__main__":
-    print("[Agent teams enabled: use spawn_teammate to create workers]")
-    state: AgentState = {"messages": []}
+    print("Agent Teams (phase16)")
+    print("Use spawn_teammate to create team members")
+    print("Type 'exit' or 'q' to quit\n")
 
     while True:
         try:
-            q = input("\033[36mphase16 >> \033[0m")
+            query = input("\033[36mphase16 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
-        if q.strip().lower() in ("q", "exit", ""):
+        if query.strip().lower() in ("q", "exit", ""):
             break
-        if q.strip() == "/team":
+        if query.strip() == "/team":
             print(TEAM.list_all())
             continue
-        if q.strip() == "/inbox":
+        if query.strip() == "/inbox":
             print(json.dumps(BUS.read_inbox("lead"), indent=2))
             continue
-
-        state["messages"].append(HumanMessage(content=q))
-        state = graph.invoke(state)
-        print()
+        run_agent(query)
