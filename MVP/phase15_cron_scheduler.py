@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 phase15_cron_scheduler.py - Cron / Scheduled Tasks
 
@@ -6,19 +7,24 @@ The agent can schedule prompts for future execution using standard cron
 expressions. When a schedule matches the current time, it pushes a
 notification back into the main conversation loop.
 
-Cron expression: 5 fields
-+-------+-------+-------+-------+-------+
-| min   | hour  | dom   | month | dow   |
-| 0-59  | 0-23  | 1-31  | 1-12  | 0-6   |
-+-------+-------+-------+-------+-------+
+    Cron expression: 5 fields
+    +-------+-------+-------+-------+-------+
+    | min   | hour  | dom   | month | dow   |
+    | 0-59  | 0-23  | 1-31  | 1-12  | 0-6   |
+    +-------+-------+-------+-------+-------+
 
-Two persistence modes:
-- session-only: In-memory list, lost on exit
-- durable: Persists to .claude/scheduled_tasks.json
+    Examples:
+      "*/5 * * * *"   -> every 5 minutes
+      "0 9 * * 1"     -> Monday 9:00 AM
+      "30 14 * * *"   -> daily 2:30 PM
 
-Two trigger modes:
-- recurring: Repeats until deleted or 7-day auto-expiry
-- one-shot: Fires once, then auto-deleted
+Key insight: Scheduling remembers future work, then hands it back to
+the same main loop when the time arrives.
+
+LangGraph concepts:
+- Use StateGraph with scheduled tasks state
+- Background thread for cron checking
+- Notification injection into conversation state
 """
 import json
 import os
@@ -28,7 +34,7 @@ import time
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
-from queue import Empty, Queue
+from queue import Queue, Empty
 from typing import Annotated, Literal, Optional
 
 from dotenv import load_dotenv
@@ -49,9 +55,7 @@ API_KEY = os.getenv("AGENCY_LLM_API_KEY")
 PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
-LLM_DIR = WORKDIR / ".mini-agent-cli"
-SCHEDULED_TASKS_FILE = LLM_DIR / "scheduled_tasks.json"
-CRON_LOCK_FILE = LLM_DIR / "cron.lock"
+SCHEDULED_TASKS_FILE = WORKDIR / ".claude" / "scheduled_tasks.json"
 AUTO_EXPIRY_DAYS = 7
 JITTER_MINUTES = [0, 30]
 JITTER_OFFSET_MAX = 4
@@ -66,37 +70,14 @@ model = init_chat_model(
 )
 
 
-class CronLock:
-    """PID-file-based lock to prevent multiple sessions from firing the same cron job."""
-
-    def __init__(self, lock_path: Path = None):
-        self._lock_path = lock_path or CRON_LOCK_FILE
-
-    def acquire(self) -> bool:
-        if self._lock_path.exists():
-            try:
-                stored_pid = int(self._lock_path.read_text().strip())
-                os.kill(stored_pid, 0)
-                return False
-            except (ValueError, ProcessLookupError, PermissionError, OSError):
-                pass
-        self._lock_path.parent.mkdir(parents=True, exist_ok=True)
-        self._lock_path.write_text(str(os.getpid()))
-        return True
-
-    def release(self):
-        """Remove the lock file if it belongs to this process."""
-        try:
-            if self._lock_path.exists():
-                stored_pid = int(self._lock_path.read_text().strip())
-                if stored_pid == os.getpid():
-                    self._lock_path.unlink()
-        except (ValueError, OSError):
-            pass
-
+# ========== Cron Utilities ==========
 
 def cron_matches(expr: str, dt: datetime) -> bool:
-    """Check if a 5-field cron expression matches a given datetime."""
+    """
+    Check if a 5-field cron expression matches a given datetime.
+    Fields: minute hour day-of-month month day-of-week
+    Supports: * (any), */N (every N), N (exact), N-M (range), N,M (list)
+    """
     fields = expr.strip().split()
     if len(fields) != 5:
         return False
@@ -133,8 +114,24 @@ def _field_matches(field: str, value: int, lo: int, hi: int) -> bool:
     return False
 
 
+# ========== CronScheduler ==========
+
 class CronScheduler:
-    """Manage scheduled tasks with background checking."""
+    """
+    Manage scheduled tasks with background checking.
+    Two persistence modes:
+    +--------------------+-------------------------------+
+    | session-only       | In-memory list, lost on exit  |
+    | durable            | .claude/scheduled_tasks.json  |
+    +--------------------+-------------------------------+
+
+    Two trigger modes:
+    +--------------------+-------------------------------+
+    | recurring          | Repeats until deleted or      |
+    |                    | 7-day auto-expiry             |
+    | one-shot           | Fires once, then auto-deleted |
+    +--------------------+-------------------------------+
+    """
 
     def __init__(self):
         self.tasks = []
@@ -263,7 +260,7 @@ class CronScheduler:
             remove_ids = set(expired) | set(fired_oneshots)
             self.tasks = [t for t in self.tasks if t["id"] not in remove_ids]
             for tid in expired:
-                print(f"[Cron] Auto-expired: {tid}")
+                print(f"[Cron] Auto-expired: {tid} (older than {AUTO_EXPIRY_DAYS} days)")
             for tid in fired_oneshots:
                 print(f"[Cron] One-shot completed and removed: {tid}")
             self._save_durable()
@@ -285,40 +282,57 @@ class CronScheduler:
         SCHEDULED_TASKS_FILE.write_text(json.dumps(durable, indent=2) + "\n")
 
 
+# Global scheduler
 scheduler = CronScheduler()
 
 
-def _safe(p: str) -> Path:
-    p = (WORKDIR / p).resolve()
+# ========== Agent State ==========
+
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
+    scheduled_notifications: list[str]
+
+
+# ========== Tool Functions ==========
+
+def safe_path(path: str) -> Path:
+    """Resolve path relative to workspace."""
+    p = (WORKDIR / path).resolve()
     if not p.is_relative_to(WORKDIR):
-        raise ValueError(p)
+        raise ValueError(f"Path escapes workspace: {path}")
     return p
 
 
 @tool
-def bash(command: str) -> str:
-    """Run a shell command."""
+def bash_tool(command: str) -> str:
+    """Run a shell command in the workspace."""
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any(item in command for item in dangerous):
+    if any(d in command for d in dangerous):
         return "[Error]: Dangerous command blocked"
     try:
         r = subprocess.run(
-            command, shell=True, cwd=WORKDIR, capture_output=True, text=True, timeout=120
+            command,
+            shell=True,
+            cwd=WORKDIR,
+            capture_output=True,
+            text=True,
+            timeout=120,
         )
+        out = (r.stdout + r.stderr).strip()
+        return out[:50000] if out else "(no output)"
     except subprocess.TimeoutExpired:
         return "[Error]: Timeout (120s)"
-    return (r.stdout + r.stderr).strip() or "(no output)"
 
 
 @tool
 def read_file(path: str, limit: Optional[int] = None) -> str:
     """Read file contents."""
     try:
-        p = _safe(path)
-        lines = p.read_text().splitlines()
+        text = safe_path(path).read_text()
+        lines = text.splitlines()
         if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
-        return "\n".join(lines)
+            lines = lines[:limit] + [f"...({len(lines) - limit} more)"]
+        return "\n".join(lines)[:50000]
     except Exception as e:
         return f"[Error]: {e}"
 
@@ -327,23 +341,23 @@ def read_file(path: str, limit: Optional[int] = None) -> str:
 def write_file(path: str, content: str) -> str:
     """Write content to a file."""
     try:
-        f = _safe(path)
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(content)
-        return f"Wrote {len(content)} bytes to {path}"
+        fp = safe_path(path)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content)
+        return f"Wrote {len(content)} bytes"
     except Exception as e:
         return f"[Error]: {e}"
 
 
 @tool
 def edit_file(path: str, old_text: str, new_text: str) -> str:
-    """Replace exact text in a file once."""
+    """Replace exact text in a file."""
     try:
-        f = _safe(path)
-        content = f.read_text()
-        if old_text not in content:
+        fp = safe_path(path)
+        c = fp.read_text()
+        if old_text not in c:
             return f"[Error]: Text not found in {path}"
-        f.write_text(content.replace(old_text, new_text, 1))
+        fp.write_text(c.replace(old_text, new_text, 1))
         return f"Edited {path}"
     except Exception as e:
         return f"[Error]: {e}"
@@ -356,7 +370,15 @@ def cron_create(
     recurring: bool = True,
     durable: bool = False,
 ) -> str:
-    """Schedule a recurring or one-shot task with a cron expression."""
+    """
+    Schedule a task with a cron expression.
+
+    Args:
+        cron: 5-field cron expression (min hour dom month dow)
+        prompt: The prompt to inject when the task fires
+        recurring: True=repeat, False=fire once then delete
+        durable: True=persist to disk, False=session-only
+    """
     return scheduler.create(cron, prompt, recurring, durable)
 
 
@@ -372,73 +394,103 @@ def cron_list() -> str:
     return scheduler.list_tasks()
 
 
-ALL_TOOLS = [bash, read_file, write_file, edit_file, cron_create, cron_delete, cron_list]
-tool_node = ToolNode(ALL_TOOLS, handle_tool_errors=True)
-model_with_tools = model.bind_tools(ALL_TOOLS)
+# Define tool list and tool node
+agent_tools = [bash_tool, read_file, write_file, edit_file, cron_create, cron_delete, cron_list]
+tool_node = ToolNode(agent_tools, handle_tool_errors=True)
+model_with_tools = model.bind_tools(agent_tools)
 
 
-class AgentState(TypedDict):
-    messages: Annotated[list, add_messages]
+# ========== Graph Nodes ==========
 
+SYSTEM_PROMPT = f"""You are a coding agent at {WORKDIR}. You can schedule future work with cron expressions.
 
-SYSTEM = (
-    f"You are a coding agent at {WORKDIR}. Use tools to solve tasks.\n\n"
-    "You can schedule future work with cron_create. Tasks fire automatically "
-    "and their prompts are injected into the conversation."
-)
+Available cron operations:
+- cron_create(cron, prompt, recurring, durable): Schedule a task
+  Example: cron_create("*/5 * * * *", "Check server status", recurring=True, durable=False)
+- cron_delete(id): Delete a scheduled task
+- cron_list(): List all scheduled tasks
+
+Cron format: 'min hour dom month dow'
+  */5 * * * * = every 5 minutes
+  0 9 * * 1 = Monday 9:00 AM
+  30 14 * * * = daily 2:30 PM
+
+Scheduled tasks fire automatically and their prompts are injected into the conversation.
+"""
 
 
 def call_model(state: AgentState) -> dict:
-    """Stream model responses with notification injection."""
-    messages_with_system = [SystemMessage(content=SYSTEM)] + state["messages"]
+    """Call the model with current messages, draining scheduled notifications."""
+    messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
 
+    # Drain scheduled task notifications
     notifications = scheduler.drain_notifications()
-    for note in notifications:
-        print(f"[Cron notification] {note[:100]}")
-        messages_with_system.append(HumanMessage(content=note))
+    if notifications:
+        for note in notifications:
+            print(f"[Cron notification] {note[:100]}")
+            messages.append(HumanMessage(content=note))
 
-    response = model_with_tools.invoke(messages_with_system)
+    response = model_with_tools.invoke(messages)
     return {"messages": [response]}
 
 
 def should_continue(state: AgentState) -> Literal["tools", END]:
-    """Decide whether to continue tool execution or finish."""
+    """Check if there are tool calls to execute."""
     last_message = state["messages"][-1]
     if isinstance(last_message, AIMessage) and last_message.tool_calls:
         return "tools"
     return END
 
 
+# Build the graph
 workflow = StateGraph(AgentState)
 workflow.add_node("agent", call_model)
 workflow.add_node("tools", tool_node)
 
 workflow.add_edge(START, "agent")
-workflow.add_conditional_edges("agent", should_continue)
 workflow.add_edge("tools", "agent")
+workflow.add_conditional_edges(
+    "agent",
+    should_continue,
+    {"tools": "tools", END: END}
+)
 
 graph = workflow.compile()
 
 
+def run_agent(query: str):
+    """Run the agent with a query."""
+    initial_state = {
+        "messages": [HumanMessage(content=query)],
+        "scheduled_notifications": [],
+    }
+
+    for event in graph.stream(initial_state):
+        node_name = list(event.keys())[0]
+        if node_name == "agent":
+            response = event[node_name]["messages"][-1]
+            if hasattr(response, 'content') and response.content:
+                print(f"\nAssistant: {response.content}")
+        elif node_name == "tools":
+            pass  # Tools handled internally
+
+
 if __name__ == "__main__":
     scheduler.start()
-    print("[Cron scheduler running. Background checks every second.]")
-    state: AgentState = {"messages": []}
+    print("Cron Scheduler Agent (phase15)")
+    print("Use cron_create to schedule future work")
+    print("Type 'exit' or 'q' to quit\n")
 
-    try:
-        while True:
-            try:
-                q = input("\033[36mphase15 >> \033[0m")
-            except (EOFError, KeyboardInterrupt):
-                break
-            if q.strip().lower() in ("q", "exit", ""):
-                break
-            if q.strip() == "/cron":
-                print(scheduler.list_tasks())
-                continue
-
-            state["messages"].append(HumanMessage(content=q))
-            state = graph.invoke(state)
-            print()
-    finally:
-        scheduler.stop()
+    while True:
+        try:
+            query = input("\033[36mphase15 >> \033[0m")
+        except (EOFError, KeyboardInterrupt):
+            scheduler.stop()
+            break
+        if query.strip().lower() in ("q", "exit", ""):
+            scheduler.stop()
+            break
+        if query.strip() == "/cron":
+            print(scheduler.list_tasks())
+            continue
+        run_agent(query)
