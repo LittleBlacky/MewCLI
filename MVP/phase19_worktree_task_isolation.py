@@ -1,11 +1,37 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 phase19_worktree_task_isolation.py - Worktree + Task Isolation
 
 Directory-level isolation for parallel task execution.
 Tasks are the control plane and worktrees are the execution plane.
 
+    .tasks/task_12.json
+      {
+        "id": 12,
+        "subject": "Implement auth refactor",
+        "status": "in_progress",
+        "worktree": "auth-refactor"
+      }
+    .worktrees/index.json
+      {
+        "worktrees": [
+          {
+            "name": "auth-refactor",
+            "path": ".../.worktrees/auth-refactor",
+            "branch": "wt/auth-refactor",
+            "task_id": 12,
+            "status": "active"
+          }
+        ]
+      }
+
 Key insight: "Isolate by directory, coordinate by task ID."
+
+LangGraph concepts:
+- Use EventBus for worktree lifecycle observability
+- TaskManager with worktree binding
+- Worktree registry for directory isolation
 """
 import json
 import os
@@ -33,6 +59,8 @@ API_KEY = os.getenv("AGENCY_LLM_API_KEY")
 PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
+WORKTREES_DIR = WORKDIR / ".worktrees"
+EVENTS_PATH = WORKTREES_DIR / "events.jsonl"
 
 model = init_chat_model(
     MODEL_ID,
@@ -44,14 +72,12 @@ model = init_chat_model(
 )
 
 
-def detect_repo_root(cwd: Path) -> Path | None:
+def detect_repo_root(cwd: Path) -> Optional[Path]:
+    """Detect git repository root."""
     try:
         r = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            timeout=10,
+            cwd=cwd, capture_output=True, text=True, timeout=10
         )
         root = Path(r.stdout.strip())
         return root if r.returncode == 0 and root.exists() else None
@@ -59,14 +85,62 @@ def detect_repo_root(cwd: Path) -> Path | None:
         return None
 
 
-REPO_ROOT = detect_repo_root(WORKDIR) or WORKDIR
-LLM_DIR = WORKDIR / ".mini-agent-cli"
-TASKS_DIR = LLM_DIR / ".tasks"
-WORKTREE_INDEX_DIR = LLM_DIR / "worktrees"
+REPO_ROOT = detect_repo_root(WORKDIR)
 
+
+class GitAvailable:
+    """Check git availability and provide worktree commands."""
+    @staticmethod
+    def is_available() -> bool:
+        return REPO_ROOT is not None
+
+    @staticmethod
+    def worktree_add(name: str, path: Path, branch: str) -> str:
+        if not REPO_ROOT:
+            return "[Error]: Not in a git repository"
+        try:
+            r = subprocess.run(
+                ["git", "worktree", "add", str(path), branch],
+                cwd=REPO_ROOT, capture_output=True, text=True, timeout=30
+            )
+            if r.returncode == 0:
+                return f"Created worktree '{name}' at {path}"
+            return f"[Error]: {r.stderr.strip()}"
+        except Exception as e:
+            return f"[Error]: {e}"
+
+    @staticmethod
+    def worktree_remove(name: str, path: Path, force: bool = False) -> str:
+        if not REPO_ROOT:
+            return "[Error]: Not in a git repository"
+        try:
+            args = ["git", "worktree", "remove", str(path)]
+            if force:
+                args.append("--force")
+            r = subprocess.run(args, cwd=REPO_ROOT, capture_output=True, text=True, timeout=30)
+            if r.returncode == 0:
+                return f"Removed worktree '{name}'"
+            return f"[Error]: {r.stderr.strip()}"
+        except Exception as e:
+            return f"[Error]: {e}"
+
+    @staticmethod
+    def status(path: Path) -> str:
+        try:
+            r = subprocess.run(["git", "status", "--porcelain"],
+                             cwd=path, capture_output=True, text=True, timeout=10)
+            return r.stdout.strip() or "(clean)"
+        except Exception as e:
+            return f"[Error]: {e}"
+
+
+WORKTREES = GitAvailable()
+
+
+# ========== EventBus ==========
 
 class EventBus:
-    """Append-only lifecycle events for observability."""
+    """Append-only lifecycle events for worktree observability."""
 
     def __init__(self, event_log_path: Path):
         self.path = event_log_path
@@ -74,7 +148,8 @@ class EventBus:
         if not self.path.exists():
             self.path.write_text("")
 
-    def emit(self, event: str, task_id=None, wt_name=None, error=None, **extra):
+    def emit(self, event: str, task_id: Optional[int] = None, wt_name: Optional[str] = None,
+             error: Optional[str] = None, **extra):
         payload = {"event": event, "ts": time.time()}
         if task_id is not None:
             payload["task_id"] = task_id
@@ -98,6 +173,110 @@ class EventBus:
         return json.dumps(items, indent=2)
 
 
+EVENTS = EventBus(EVENTS_PATH)
+
+
+# ========== WorktreeRegistry ==========
+
+class WorktreeRegistry:
+    """Manage worktree directory isolation."""
+
+    def __init__(self, worktrees_dir: Path):
+        self.dir = worktrees_dir
+        self.index_path = self.dir / "index.json"
+        self.dir.mkdir(parents=True, exist_ok=True)
+        self.worktrees = self._load()
+
+    def _load(self) -> dict:
+        if self.index_path.exists():
+            return json.loads(self.index_path.read_text())
+        return {"worktrees": []}
+
+    def _save(self):
+        self.index_path.write_text(json.dumps(self.worktrees, indent=2))
+
+    def create(self, name: str, task_id: Optional[int] = None, base_ref: str = "HEAD") -> dict:
+        """Create a new worktree."""
+        if any(w["name"] == name for w in self.worktrees["worktrees"]):
+            raise ValueError(f"Worktree '{name}' already exists")
+
+        path = self.dir / name
+        branch = f"wt/{name}"
+
+        # Create the worktree directory and init git
+        if WORKTREES.is_available():
+            result = WORKTREES.worktree_add(name, path, branch)
+            if "[Error]" in result:
+                raise ValueError(result)
+        else:
+            path.mkdir(parents=True, exist_ok=True)
+            result = f"Created directory {path} (git not available)"
+
+        wt = {
+            "name": name,
+            "path": str(path),
+            "branch": branch,
+            "task_id": task_id,
+            "status": "active",
+            "created_at": time.time(),
+            "last_used": time.time(),
+        }
+        self.worktrees["worktrees"].append(wt)
+        self._save()
+        EVENTS.emit("worktree_created", wt_name=name, task_id=task_id)
+        return wt
+
+    def get(self, name: str) -> Optional[dict]:
+        for w in self.worktrees["worktrees"]:
+            if w["name"] == name:
+                return w
+        return None
+
+    def list_all(self) -> list:
+        return self.worktrees["worktrees"]
+
+    def update(self, name: str, updates: dict) -> dict:
+        for w in self.worktrees["worktrees"]:
+            if w["name"] == name:
+                w.update(updates)
+                self._save()
+                return w
+        raise ValueError(f"Worktree '{name}' not found")
+
+    def closeout(self, name: str, action: str, reason: str = "", force: bool = False,
+                 complete_task: bool = False) -> dict:
+        """Close out a worktree lane."""
+        wt = self.get(name)
+        if not wt:
+            raise ValueError(f"Worktree '{name}' not found")
+
+        task_id = wt.get("task_id")
+        path = Path(wt["path"])
+
+        if action == "remove":
+            if path.exists():
+                result = WORKTREES.worktree_remove(name, path, force)
+                EVENTS.emit("worktree_removed", wt_name=name, task_id=task_id, **({"error": result} if "[Error]" in result else {}))
+            self.worktrees["worktrees"] = [w for w in self.worktrees["worktrees"] if w["name"] != name]
+            self._save()
+            if complete_task and task_id:
+                TASKS.update(task_id, status="completed")
+                EVENTS.emit("task_completed", task_id=task_id)
+            return {"action": "removed", "result": result}
+
+        elif action == "keep":
+            self.update(name, {"status": "kept", "closeout_reason": reason})
+            EVENTS.emit("worktree_kept", wt_name=name, task_id=task_id, reason=reason)
+            return {"action": "kept", "reason": reason}
+
+        raise ValueError(f"Unknown action: {action}")
+
+
+REGISTRY = WorktreeRegistry(WORKTREES_DIR)
+
+
+# ========== TaskManager ==========
+
 class TaskManager:
     """Persistent task board with optional worktree binding."""
 
@@ -110,7 +289,9 @@ class TaskManager:
         ids = []
         for f in self.dir.glob("task_*.json"):
             try:
-                ids.append(int(f.stem.split("_")[1]))
+                parts = f.stem.split("_")
+                if len(parts) == 2 and parts[1].isdigit():
+                    ids.append(int(parts[1]))
             except Exception:
                 pass
         return max(ids) if ids else 0
@@ -127,7 +308,7 @@ class TaskManager:
     def _save(self, task: dict):
         self._path(task["id"]).write_text(json.dumps(task, indent=2))
 
-    def create(self, subject: str, description: str = "") -> str:
+    def create(self, subject: str, description: str = "") -> dict:
         task = {
             "id": self._next_id,
             "subject": subject,
@@ -139,423 +320,221 @@ class TaskManager:
             "last_worktree": "",
             "closeout": None,
             "blockedBy": [],
-            "created_at": time.time(),
-            "updated_at": time.time(),
+            "blocks": [],
         }
         self._save(task)
         self._next_id += 1
-        return json.dumps(task, indent=2)
+        EVENTS.emit("task_created", task_id=task["id"])
+        return task
 
-    def get(self, task_id: int) -> str:
-        return json.dumps(self._load(task_id), indent=2)
+    def get(self, task_id: int) -> dict:
+        return self._load(task_id)
 
-    def exists(self, task_id: int) -> bool:
-        return self._path(task_id).exists()
-
-    def update(self, task_id: int, status: str = None, owner: str = None) -> str:
+    def update(self, task_id: int, status: Optional[str] = None, owner: Optional[str] = None) -> dict:
         task = self._load(task_id)
+        if owner is not None:
+            task["owner"] = owner
         if status:
             if status not in ("pending", "in_progress", "completed", "deleted"):
                 raise ValueError(f"Invalid status: {status}")
             task["status"] = status
-        if owner is not None:
-            task["owner"] = owner
-        task["updated_at"] = time.time()
+            if status == "completed":
+                for f in self.dir.glob("task_*.json"):
+                    t = json.loads(f.read_text())
+                    if task_id in t.get("blockedBy", []):
+                        t["blockedBy"].remove(task_id)
+                        self._save(t)
         self._save(task)
-        return json.dumps(task, indent=2)
+        EVENTS.emit("task_updated", task_id=task_id, status=status)
+        return task
 
-    def bind_worktree(self, task_id: int, worktree: str, owner: str = "") -> str:
+    def bind_worktree(self, task_id: int, worktree: str, owner: str = "") -> dict:
         task = self._load(task_id)
+        if task.get("worktree"):
+            task["last_worktree"] = task["worktree"]
         task["worktree"] = worktree
-        task["last_worktree"] = worktree
         task["worktree_state"] = "active"
         if owner:
             task["owner"] = owner
-        if task["status"] == "pending":
-            task["status"] = "in_progress"
-        task["updated_at"] = time.time()
         self._save(task)
-        return json.dumps(task, indent=2)
+        EVENTS.emit("task_bound_worktree", task_id=task_id, worktree=worktree)
+        return task
 
-    def unbind_worktree(self, task_id: int) -> str:
-        task = self._load(task_id)
-        task["worktree"] = ""
-        task["worktree_state"] = "unbound"
-        task["updated_at"] = time.time()
-        self._save(task)
-        return json.dumps(task, indent=2)
-
-    def record_closeout(self, task_id: int, action: str, reason: str = "", keep_binding: bool = False) -> str:
-        task = self._load(task_id)
-        task["closeout"] = {"action": action, "reason": reason, "at": time.time()}
-        task["worktree_state"] = action
-        if not keep_binding:
-            task["worktree"] = ""
-        task["updated_at"] = time.time()
-        self._save(task)
-        return json.dumps(task, indent=2)
-
-    def list_all(self) -> str:
-        tasks = []
-        for f in sorted(self.dir.glob("task_*.json")):
-            tasks.append(json.loads(f.read_text()))
-        if not tasks:
-            return "No tasks."
-        lines = []
-        for t in tasks:
-            marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]", "deleted": "[-]"}.get(t["status"], "[?]")
-            owner = f" owner={t['owner']}" if t.get("owner") else ""
-            wt = f" wt={t['worktree']}" if t.get("worktree") else ""
-            lines.append(f"{marker} #{t['id']}: {t['subject']}{owner}{wt}")
-        return "\n".join(lines)
+    def list_all(self) -> list:
+        return [json.loads(f.read_text()) for f in sorted(self.dir.glob("task_*.json"))]
 
 
-TASKS = TaskManager(TASKS_DIR)
-EVENTS = EventBus(WORKTREE_INDEX_DIR / "events.jsonl")
+TASKS = TaskManager(WORKDIR / ".tasks")
 
 
-class WorktreeManager:
-    """Create/list/run/remove git worktrees."""
+# ========== Base Tool Implementations ==========
 
-    def __init__(self, repo_root: Path, tasks: TaskManager, events: EventBus):
-        self.repo_root = repo_root
-        self.tasks = tasks
-        self.events = events
-        self.dir = WORKTREE_INDEX_DIR
-        self.dir.mkdir(parents=True, exist_ok=True)
-        self.index_path = self.dir / "index.json"
-        if not self.index_path.exists():
-            self.index_path.write_text(json.dumps({"worktrees": []}, indent=2))
-        self.git_available = self._check_git()
-
-    def _check_git(self) -> bool:
-        try:
-            r = subprocess.run(
-                ["git", "rev-parse", "--is-inside-work-tree"],
-                cwd=self.repo_root,
-                capture_output=True,
-                text=True,
-                timeout=10,
-            )
-            return r.returncode == 0
-        except Exception:
-            return False
-
-    def _run_git(self, args: list[str]) -> str:
-        if not self.git_available:
-            raise RuntimeError("Not in a git repository.")
-        r = subprocess.run(
-            ["git", *args], cwd=self.repo_root, capture_output=True, text=True, timeout=120
-        )
-        if r.returncode != 0:
-            raise RuntimeError((r.stdout + r.stderr).strip() or f"git {' '.join(args)} failed")
-        return (r.stdout + r.stderr).strip() or "(no output)"
-
-    def _load_index(self) -> dict:
-        return json.loads(self.index_path.read_text())
-
-    def _save_index(self, data: dict):
-        self.index_path.write_text(json.dumps(data, indent=2))
-
-    def _find(self, name: str) -> dict | None:
-        for wt in self._load_index().get("worktrees", []):
-            if wt.get("name") == name:
-                return wt
-        return None
-
-    def _update_entry(self, name: str, **changes) -> dict:
-        idx = self._load_index()
-        updated = None
-        for item in idx.get("worktrees", []):
-            if item.get("name") == name:
-                item.update(changes)
-                updated = item
-                break
-        self._save_index(idx)
-        if not updated:
-            raise ValueError(f"Worktree '{name}' not found in index")
-        return updated
-
-    def _validate_name(self, name: str):
-        if not re.fullmatch(r"[A-Za-z0-9._-]{1,40}", name or ""):
-            raise ValueError("Invalid worktree name. Use 1-40 chars: letters, digits, ., _, -")
-
-    def create(self, name: str, task_id: int = None, base_ref: str = "HEAD") -> str:
-        self._validate_name(name)
-        if self._find(name):
-            raise ValueError(f"Worktree '{name}' already exists")
-        if task_id is not None and not self.tasks.exists(task_id):
-            raise ValueError(f"Task {task_id} not found")
-        path = self.dir / name
-        branch = f"wt/{name}"
-        self.events.emit("worktree.create.before", task_id=task_id, wt_name=name)
-        try:
-            self._run_git(["worktree", "add", "-b", branch, str(path), base_ref])
-            entry = {
-                "name": name, "path": str(path), "branch": branch,
-                "task_id": task_id, "status": "active", "created_at": time.time(),
-            }
-            idx = self._load_index()
-            idx["worktrees"].append(entry)
-            self._save_index(idx)
-            if task_id is not None:
-                self.tasks.bind_worktree(task_id, name)
-            self.events.emit("worktree.create.after", task_id=task_id, wt_name=name)
-            return json.dumps(entry, indent=2)
-        except Exception as e:
-            self.events.emit("worktree.create.failed", task_id=task_id, wt_name=name, error=str(e))
-            raise
-
-    def list_all(self) -> str:
-        wts = self._load_index().get("worktrees", [])
-        if not wts:
-            return "No worktrees in index."
-        lines = []
-        for wt in wts:
-            suffix = f" task={wt['task_id']}" if wt.get("task_id") else ""
-            lines.append(f"[{wt.get('status', '?')}] {wt['name']} -> {wt['path']} ({wt.get('branch', '-')}){suffix}")
-        return "\n".join(lines)
-
-    def status(self, name: str) -> str:
-        wt = self._find(name)
-        if not wt:
-            return f"Error: Unknown worktree '{name}'"
-        path = Path(wt["path"])
-        if not path.exists():
-            return f"Error: Worktree path missing: {path}"
-        r = subprocess.run(
-            ["git", "status", "--short", "--branch"],
-            cwd=path, capture_output=True, text=True, timeout=60
-        )
-        return (r.stdout + r.stderr).strip() or "Clean worktree"
-
-    def enter(self, name: str) -> str:
-        wt = self._find(name)
-        if not wt:
-            return f"Error: Unknown worktree '{name}'"
-        path = Path(wt["path"])
-        if not path.exists():
-            return f"Error: Worktree path missing: {path}"
-        updated = self._update_entry(name, last_entered_at=time.time())
-        self.events.emit("worktree.enter", task_id=wt.get("task_id"), wt_name=name, path=str(path))
-        return json.dumps(updated, indent=2)
-
-    def run(self, name: str, command: str) -> str:
-        dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-        if any(d in command for d in dangerous):
-            return "Error: Dangerous command blocked"
-        wt = self._find(name)
-        if not wt:
-            return f"Error: Unknown worktree '{name}'"
-        path = Path(wt["path"])
-        if not path.exists():
-            return f"Error: Worktree path missing: {path}"
-        try:
-            self._update_entry(name, last_entered_at=time.time(), last_command_at=time.time(),
-                              last_command_preview=command[:120])
-            self.events.emit("worktree.run.before", task_id=wt.get("task_id"), wt_name=name, command=command[:120])
-            r = subprocess.run(command, shell=True, cwd=path, capture_output=True, text=True, timeout=300)
-            out = (r.stdout + r.stderr).strip()
-            self.events.emit("worktree.run.after", task_id=wt.get("task_id"), wt_name=name)
-            return out[:50000] if out else "(no output)"
-        except subprocess.TimeoutExpired:
-            self.events.emit("worktree.run.timeout", task_id=wt.get("task_id"), wt_name=name)
-            return "Error: Timeout (300s)"
-
-    def remove(self, name: str, force: bool = False, complete_task: bool = False, reason: str = "") -> str:
-        wt = self._find(name)
-        if not wt:
-            return f"Error: Unknown worktree '{name}'"
-        task_id = wt.get("task_id")
-        self.events.emit("worktree.remove.before", task_id=task_id, wt_name=name)
-        try:
-            args = ["worktree", "remove"]
-            if force:
-                args.append("--force")
-            args.append(wt["path"])
-            self._run_git(args)
-            if complete_task and task_id is not None:
-                self.tasks.update(task_id, status="completed")
-                self.events.emit("task.completed", task_id=task_id, wt_name=name)
-            if task_id is not None:
-                self.tasks.record_closeout(task_id, "removed", reason, keep_binding=False)
-            self._update_entry(name, status="removed", removed_at=time.time(),
-                              closeout={"action": "remove", "reason": reason, "at": time.time()})
-            self.events.emit("worktree.remove.after", task_id=task_id, wt_name=name)
-            return f"Removed worktree '{name}'"
-        except Exception as e:
-            self.events.emit("worktree.remove.failed", task_id=task_id, wt_name=name, error=str(e))
-            raise
-
-    def keep(self, name: str) -> str:
-        wt = self._find(name)
-        if not wt:
-            return f"Error: Unknown worktree '{name}'"
-        if wt.get("task_id") is not None:
-            self.tasks.record_closeout(wt["task_id"], "kept", "", keep_binding=True)
-        self._update_entry(name, status="kept", kept_at=time.time(),
-                          closeout={"action": "keep", "reason": "", "at": time.time()})
-        self.events.emit("worktree.keep", task_id=wt.get("task_id"), wt_name=name)
-        return json.dumps(self._find(name), indent=2)
-
-    def closeout(self, name: str, action: str, reason: str = "", force: bool = False, complete_task: bool = False) -> str:
-        if action == "keep":
-            wt = self._find(name)
-            if not wt:
-                return f"Error: Unknown worktree '{name}'"
-            if wt.get("task_id") is not None:
-                self.tasks.record_closeout(wt["task_id"], "kept", reason, keep_binding=True)
-                if complete_task:
-                    self.tasks.update(wt["task_id"], status="completed")
-            self._update_entry(name, status="kept", kept_at=time.time(),
-                              closeout={"action": "keep", "reason": reason, "at": time.time()})
-            self.events.emit("worktree.closeout.keep", task_id=wt.get("task_id"), wt_name=name, reason=reason)
-            return json.dumps(self._find(name), indent=2)
-        if action == "remove":
-            self.events.emit("worktree.closeout.remove", wt_name=name, reason=reason)
-            return self.remove(name, force=force, complete_task=complete_task, reason=reason)
-        raise ValueError("action must be 'keep' or 'remove'")
+def safe_path(p: str) -> Path:
+    path = (WORKDIR / p).resolve()
+    if not path.is_relative_to(WORKDIR):
+        raise ValueError(f"Path escapes workspace: {p}")
+    return path
 
 
-WORKTREES = WorktreeManager(REPO_ROOT, TASKS, EVENTS)
-
-
-def _safe(p: str) -> Path:
-    p = (WORKDIR / p).resolve()
-    if not p.is_relative_to(WORKDIR):
-        raise ValueError(p)
-    return p
-
-
-@tool
-def bash(command: str) -> str:
-    """Run a shell command in the current workspace."""
+def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any(item in command for item in dangerous):
+    if any(d in command for d in dangerous):
         return "[Error]: Dangerous command blocked"
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR, capture_output=True, text=True, timeout=120)
+        return (r.stdout + r.stderr).strip()[:50000] or "(no output)"
     except subprocess.TimeoutExpired:
         return "[Error]: Timeout (120s)"
-    return (r.stdout + r.stderr).strip() or "(no output)"
 
-
-@tool
-def read_file(path: str, limit: Optional[int] = None) -> str:
-    """Read file contents."""
+def run_read(path: str) -> str:
     try:
-        p = _safe(path)
-        lines = p.read_text().splitlines()
-        if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
-        return "\n".join(lines)
+        return safe_path(path).read_text()[:50000]
     except Exception as e:
         return f"[Error]: {e}"
 
-
-@tool
-def write_file(path: str, content: str) -> str:
-    """Write content to a file."""
+def run_write(path: str, content: str) -> str:
     try:
-        f = _safe(path)
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(content)
-        return f"Wrote {len(content)} bytes to {path}"
+        fp = safe_path(path)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content)
+        return f"Wrote {len(content)} bytes"
     except Exception as e:
         return f"[Error]: {e}"
 
-
-@tool
-def edit_file(path: str, old_text: str, new_text: str) -> str:
-    """Replace exact text in a file once."""
+def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
-        f = _safe(path)
-        content = f.read_text()
-        if old_text not in content:
+        fp = safe_path(path)
+        c = fp.read_text()
+        if old_text not in c:
             return f"[Error]: Text not found in {path}"
-        f.write_text(content.replace(old_text, new_text, 1))
+        fp.write_text(c.replace(old_text, new_text, 1))
         return f"Edited {path}"
     except Exception as e:
         return f"[Error]: {e}"
 
 
+# ========== Agent State ==========
+
+class AgentState(TypedDict):
+    messages: Annotated[list, add_messages]
+
+
+# ========== Tool Functions ==========
+
+@tool
+def bash_tool(command: str) -> str:
+    """Run a shell command."""
+    return run_bash(command)
+
+@tool
+def read_file(path: str) -> str:
+    """Read file contents."""
+    return run_read(path)
+
+@tool
+def write_file(path: str, content: str) -> str:
+    """Write content to a file."""
+    return run_write(path, content)
+
+@tool
+def edit_file(path: str, old_text: str, new_text: str) -> str:
+    """Replace exact text in a file."""
+    return run_edit(path, old_text, new_text)
+
 @tool
 def task_create(subject: str, description: str = "") -> str:
-    """Create a new task on the shared task board."""
-    return TASKS.create(subject, description)
-
+    """Create a new task."""
+    return json.dumps(TASKS.create(subject, description), indent=2)
 
 @tool
 def task_list() -> str:
     """List all tasks with status, owner, and worktree binding."""
-    return TASKS.list_all()
-
+    tasks = TASKS.list_all()
+    if not tasks:
+        return "No tasks."
+    lines = []
+    for t in tasks:
+        marker = {"pending": "[ ]", "in_progress": "[>]", "completed": "[x]", "deleted": "[-]"}.get(t["status"], "[?]")
+        owner = f" owner={t['owner']}" if t.get("owner") else ""
+        wt = f" @ {t['worktree']}" if t.get("worktree") else ""
+        lines.append(f"{marker} #{t['id']}: {t['subject']}{owner}{wt}")
+    return "\n".join(lines)
 
 @tool
 def task_get(task_id: int) -> str:
     """Get task details by ID."""
-    return TASKS.get(task_id)
-
+    try:
+        return json.dumps(TASKS.get(task_id), indent=2)
+    except ValueError as e:
+        return f"[Error]: {e}"
 
 @tool
 def task_update(task_id: int, status: Optional[str] = None, owner: Optional[str] = None) -> str:
     """Update task status or owner."""
-    return TASKS.update(task_id, status, owner)
-
+    try:
+        return json.dumps(TASKS.update(task_id, status, owner), indent=2)
+    except ValueError as e:
+        return f"[Error]: {e}"
 
 @tool
 def task_bind_worktree(task_id: int, worktree: str, owner: str = "") -> str:
     """Bind a task to a worktree name."""
-    return TASKS.bind_worktree(task_id, worktree, owner)
-
+    try:
+        return json.dumps(TASKS.bind_worktree(task_id, worktree, owner), indent=2)
+    except ValueError as e:
+        return f"[Error]: {e}"
 
 @tool
 def worktree_create(name: str, task_id: Optional[int] = None, base_ref: str = "HEAD") -> str:
     """Create a git worktree and optionally bind it to a task."""
-    return WORKTREES.create(name, task_id, base_ref)
-
+    try:
+        wt = REGISTRY.create(name, task_id, base_ref)
+        if task_id:
+            TASKS.bind_worktree(task_id, name)
+        return json.dumps(wt, indent=2)
+    except ValueError as e:
+        return f"[Error]: {e}"
 
 @tool
 def worktree_list() -> str:
-    """List worktrees tracked in .worktrees/index.json."""
-    return WORKTREES.list_all()
-
-
-@tool
-def worktree_enter(name: str) -> str:
-    """Enter or reopen a worktree lane before working in it."""
-    return WORKTREES.enter(name)
-
+    """List worktrees."""
+    wts = REGISTRY.list_all()
+    if not wts:
+        return "No worktrees."
+    lines = []
+    for w in wts:
+        lines.append(f"  {w['name']}: {w['path']} ({w['status']})")
+    return "\n".join(lines)
 
 @tool
 def worktree_status(name: str) -> str:
-    """Show git status for one worktree."""
-    return WORKTREES.status(name)
-
+    """Show git status for a worktree."""
+    wt = REGISTRY.get(name)
+    if not wt:
+        return f"[Error]: Worktree '{name}' not found"
+    return WORKTREES.status(Path(wt["path"]))
 
 @tool
 def worktree_run(name: str, command: str) -> str:
     """Run a shell command in a named worktree directory."""
-    return WORKTREES.run(name, command)
-
+    wt = REGISTRY.get(name)
+    if not wt:
+        return f"[Error]: Worktree '{name}' not found"
+    path = Path(wt["path"])
+    try:
+        r = subprocess.run(command, shell=True, cwd=path, capture_output=True, text=True, timeout=120)
+        return (r.stdout + r.stderr).strip()[:50000] or "(no output)"
+    except subprocess.TimeoutExpired:
+        return "[Error]: Timeout (120s)"
 
 @tool
-def worktree_closeout(name: str, action: str, reason: str = "", force: bool = False, complete_task: bool = False) -> str:
+def worktree_closeout(name: str, action: str, reason: str = "", force: bool = False,
+                      complete_task: bool = False) -> str:
     """Close out a lane by keeping it for follow-up or removing it."""
-    return WORKTREES.closeout(name, action, reason, force, complete_task)
-
-
-@tool
-def worktree_keep(name: str) -> str:
-    """Mark a worktree as kept without removing it."""
-    return WORKTREES.keep(name)
-
-
-@tool
-def worktree_remove(name: str, force: bool = False, complete_task: bool = False, reason: str = "") -> str:
-    """Remove a worktree and optionally mark its bound task completed."""
-    return WORKTREES.remove(name, force, complete_task, reason)
-
+    try:
+        return json.dumps(REGISTRY.closeout(name, action, reason, force, complete_task), indent=2)
+    except ValueError as e:
+        return f"[Error]: {e}"
 
 @tool
 def worktree_events(limit: int = 20) -> str:
@@ -563,31 +542,29 @@ def worktree_events(limit: int = 20) -> str:
     return EVENTS.list_recent(limit)
 
 
-ALL_TOOLS = [
-    bash, read_file, write_file, edit_file,
+# Define tool list and tool node
+agent_tools = [
+    bash_tool, read_file, write_file, edit_file,
     task_create, task_list, task_get, task_update, task_bind_worktree,
-    worktree_create, worktree_list, worktree_enter, worktree_status, worktree_run,
-    worktree_closeout, worktree_keep, worktree_remove, worktree_events
+    worktree_create, worktree_list, worktree_status, worktree_run, worktree_closeout, worktree_events
 ]
-tool_node = ToolNode(ALL_TOOLS, handle_tool_errors=True)
-model_with_tools = model.bind_tools(ALL_TOOLS)
+tool_node = ToolNode(agent_tools, handle_tool_errors=True)
+model_with_tools = model.bind_tools(agent_tools)
 
 
-class AgentState(TypedDict):
-    messages: Annotated[list, add_messages]
+# ========== Graph Nodes ==========
 
+SYSTEM_PROMPT = f"""You are a coding agent at {WORKDIR}. Use task + worktree tools for multi-task work.
 
-SYSTEM = (
-    f"You are a coding agent at {WORKDIR}. "
-    "Use task + worktree tools for multi-task work. "
-    "For parallel or risky changes: create tasks, allocate worktree lanes, "
-    "run commands in those lanes, then choose keep/remove for closeout."
-)
+For parallel or risky changes: create tasks, allocate worktree lanes, run commands in those lanes, then choose keep/remove for closeout.
+
+Key insight: "Isolate by directory, coordinate by task ID."
+"""
 
 
 def call_model(state: AgentState) -> dict:
-    messages_with_system = [SystemMessage(content=SYSTEM)] + state["messages"]
-    response = model_with_tools.invoke(messages_with_system)
+    messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+    response = model_with_tools.invoke(messages)
     return {"messages": [response]}
 
 
@@ -601,28 +578,34 @@ def should_continue(state: AgentState) -> Literal["tools", END]:
 workflow = StateGraph(AgentState)
 workflow.add_node("agent", call_model)
 workflow.add_node("tools", tool_node)
-
 workflow.add_edge(START, "agent")
-workflow.add_conditional_edges("agent", should_continue)
 workflow.add_edge("tools", "agent")
+workflow.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
 
 graph = workflow.compile()
 
 
+def run_agent(query: str):
+    initial_state = {"messages": [HumanMessage(content=query)]}
+    for event in graph.stream(initial_state):
+        node_name = list(event.keys())[0]
+        if node_name == "agent":
+            response = event[node_name]["messages"][-1]
+            if hasattr(response, 'content') and response.content:
+                print(f"\nAssistant: {response.content}")
+
+
 if __name__ == "__main__":
-    print(f"Repo root: {REPO_ROOT}")
-    if not WORKTREES.git_available:
-        print("Note: Not in a git repo. worktree_* tools will return errors.")
-    state: AgentState = {"messages": []}
+    print("Worktree Task Isolation (phase19)")
+    if not WORKTREES.is_available():
+        print("Note: Not in a git repo. Worktree tools will create directories only.")
+    print("Type 'exit' or 'q' to quit\n")
 
     while True:
         try:
-            q = input("\033[36mphase19 >> \033[0m")
+            query = input("\033[36mphase19 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
-        if q.strip().lower() in ("q", "exit", ""):
+        if query.strip().lower() in ("q", "exit", ""):
             break
-
-        state["messages"].append(HumanMessage(content=q))
-        state = graph.invoke(state)
-        print()
+        run_agent(query)
