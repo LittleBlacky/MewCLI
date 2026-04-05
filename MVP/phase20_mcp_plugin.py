@@ -1,22 +1,33 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 """
 phase20_mcp_plugin.py - MCP & Plugin System
 
 External processes can expose tools, and your agent can treat them like
-normal tools after normalization.
+normal tools after a small amount of normalization.
 
 Minimal path:
-1. start an MCP server process
-2. ask it which tools it has
-3. prefix and register those tools
-4. route matching calls to that server
+  1. start an MCP server process
+  2. ask it which tools it has
+  3. prefix and register those tools
+  4. route matching calls to that server
+
+Plugins add one more layer: discovery. A tiny manifest tells the agent which
+external server to start.
 
 Key insight: "External tools should enter the same tool pipeline, not form a
 completely separate world."
+
+LangGraph concepts:
+- Use CapabilityPermissionGate for unified permission handling
+- MCPClient for stdio-based external tool exposure
+- PluginLoader for manifest-based server discovery
+- MCPToolRouter for unified tool pool
 """
 import json
 import os
 import subprocess
+import threading
 from pathlib import Path
 from typing import Annotated, Literal, Optional
 
@@ -50,8 +61,15 @@ model = init_chat_model(
 )
 
 
+# ========== CapabilityPermissionGate ==========
+
 class CapabilityPermissionGate:
-    """Shared permission gate for native tools and external capabilities."""
+    """
+    Shared permission gate for native tools and external capabilities.
+    MCP does not bypass the control plane.
+    Native tools and MCP tools both become normalized capability intents first,
+    then pass through the same allow / ask policy.
+    """
 
     READ_PREFIXES = ("read", "list", "get", "show", "search", "query", "inspect")
     HIGH_RISK_PREFIXES = ("delete", "remove", "drop", "shutdown")
@@ -103,8 +121,14 @@ class CapabilityPermissionGate:
 permission_gate = CapabilityPermissionGate()
 
 
+# ========== MCPClient ==========
+
 class MCPClient:
-    """Minimal MCP client over stdio."""
+    """
+    Minimal MCP client over stdio.
+    Enough to teach the core architecture without dragging through
+    every transport, auth flow, or marketplace detail.
+    """
 
     def __init__(self, server_name: str, command: str, args: list = None, env: dict = None):
         self.server_name = server_name
@@ -113,139 +137,60 @@ class MCPClient:
         self.env = {**os.environ, **(env or {})}
         self.process = None
         self._request_id = 0
-        self._tools = []
 
-    def connect(self):
-        """Start the MCP server process."""
+    def connect(self) -> bool:
         try:
             self.process = subprocess.Popen(
                 [self.command] + self.args,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                env=self.env,
-                text=True,
+                stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                env=self.env, text=True
             )
-            self._send({
-                "method": "initialize",
-                "params": {
-                    "protocolVersion": "2024-11-05",
-                    "capabilities": {},
-                    "clientInfo": {"name": "teaching-agent", "version": "1.0"},
-                },
-            })
-            response = self._recv()
-            if response and "result" in response:
-                self._send({"method": "notifications/initialized"})
-                return True
-        except FileNotFoundError:
-            print(f"[MCP] Server command not found: {self.command}")
+            return True
         except Exception as e:
-            print(f"[MCP] Connection failed: {e}")
-        return False
+            print(f"[MCP] Failed to start {self.server_name}: {e}")
+            return False
+
+    def _send(self, msg: dict) -> dict:
+        if not self.process or self.process.poll() is not None:
+            return {"error": "Server not running"}
+        request_id = str(self._request_id)
+        self._request_id += 1
+        msg["jsonrpc"] = "2.0"
+        msg["id"] = request_id
+        self.process.stdin.write(json.dumps(msg) + "\n")
+        self.process.stdin.flush()
+        try:
+            response = self.process.stdout.readline()
+            if response:
+                return json.loads(response)
+        except Exception:
+            pass
+        return {"error": "No response"}
 
     def list_tools(self) -> list:
-        """Fetch available tools from the server."""
-        self._send({"method": "tools/list", "params": {}})
-        response = self._recv()
-        if response and "result" in response:
-            self._tools = response["result"].get("tools", [])
-        return self._tools
+        result = self._send({"method": "tools/list", "params": {}})
+        if "result" in result:
+            return result["result"].get("tools", [])
+        return []
 
     def call_tool(self, tool_name: str, arguments: dict) -> str:
-        """Execute a tool on the server."""
-        self._send({"method": "tools/call", "params": {"name": tool_name, "arguments": arguments}})
-        response = self._recv()
-        if response and "result" in response:
-            content = response["result"].get("content", [])
-            return "\n".join(c.get("text", str(c)) for c in content)
-        if response and "error" in response:
-            return f"MCP Error: {response['error'].get('message', 'unknown')}"
-        return "MCP Error: no response"
-
-    def get_agent_tools(self) -> list:
-        """Convert MCP tools to agent tool format."""
-        agent_tools = []
-        for tool in self._tools:
-            prefixed_name = f"mcp__{self.server_name}__{tool['name']}"
-            agent_tools.append({
-                "name": prefixed_name,
-                "description": tool.get("description", ""),
-                "input_schema": tool.get("inputSchema", {"type": "object", "properties": {}}),
-                "_mcp_server": self.server_name,
-                "_mcp_tool": tool["name"],
-            })
-        return agent_tools
+        result = self._send({"method": "tools/call", "params": {"name": tool_name, "arguments": arguments}})
+        if "result" in result:
+            return json.dumps(result["result"], ensure_ascii=False)
+        if "error" in result:
+            return f"[MCP Error]: {result['error']}"
+        return "[MCP Error]: Unknown response"
 
     def disconnect(self):
-        """Shut down the server process."""
         if self.process:
-            try:
-                self._send({"method": "shutdown"})
-                self.process.terminate()
-                self.process.wait(timeout=5)
-            except Exception:
-                self.process.kill()
-            self.process = None
-
-    def _send(self, message: dict):
-        if not self.process or self.process.poll() is not None:
-            return
-        self._request_id += 1
-        envelope = {"jsonrpc": "2.0", "id": self._request_id, **message}
-        line = json.dumps(envelope) + "\n"
-        try:
-            self.process.stdin.write(line)
-            self.process.stdin.flush()
-        except (BrokenPipeError, OSError):
-            pass
-
-    def _recv(self) -> dict | None:
-        if not self.process or self.process.poll() is not None:
-            return None
-        try:
-            line = self.process.stdout.readline()
-            if line:
-                return json.loads(line)
-        except (json.JSONDecodeError, OSError):
-            pass
-        return None
+            self.process.terminate()
+            self.process.wait(timeout=5)
 
 
-class PluginLoader:
-    """Load plugins from .claude-plugin/ directories."""
-
-    def __init__(self, search_dirs: list = None):
-        self.search_dirs = search_dirs or [WORKDIR]
-        self.plugins = {}
-
-    def scan(self) -> list:
-        """Scan directories for .claude-plugin/plugin.json manifests."""
-        found = []
-        for search_dir in self.search_dirs:
-            plugin_dir = Path(search_dir) / ".claude-plugin"
-            manifest_path = plugin_dir / "plugin.json"
-            if manifest_path.exists():
-                try:
-                    manifest = json.loads(manifest_path.read_text())
-                    name = manifest.get("name", plugin_dir.parent.name)
-                    self.plugins[name] = manifest
-                    found.append(name)
-                except (json.JSONDecodeError, OSError) as e:
-                    print(f"[Plugin] Failed to load {manifest_path}: {e}")
-        return found
-
-    def get_mcp_servers(self) -> dict:
-        """Extract MCP server configs from loaded plugins."""
-        servers = {}
-        for plugin_name, manifest in self.plugins.items():
-            for server_name, config in manifest.get("mcpServers", {}).items():
-                servers[f"{plugin_name}__{server_name}"] = config
-        return servers
-
+# ========== MCPToolRouter ==========
 
 class MCPToolRouter:
-    """Routes tool calls to the correct MCP server."""
+    """Route MCP tool calls to the appropriate server."""
 
     def __init__(self):
         self.clients = {}
@@ -256,85 +201,125 @@ class MCPToolRouter:
     def is_mcp_tool(self, tool_name: str) -> bool:
         return tool_name.startswith("mcp__")
 
-    def call(self, tool_name: str, arguments: dict) -> str:
-        """Route an MCP tool call to the correct server."""
-        parts = tool_name.split("__", 2)
-        if len(parts) != 3:
-            return f"Error: Invalid MCP tool name: {tool_name}"
-        _, server_name, actual_tool = parts
+    def call(self, tool_name: str, tool_input: dict) -> str:
+        if not self.is_mcp_tool(tool_name):
+            return "[Error]: Not an MCP tool"
+        _, server_name, actual_tool = tool_name.split("__", 2)
         client = self.clients.get(server_name)
         if not client:
-            return f"Error: MCP server not found: {server_name}"
-        return client.call_tool(actual_tool, arguments)
+            return f"[Error]: Unknown MCP server: {server_name}"
+        return client.call_tool(actual_tool, tool_input)
 
     def get_all_tools(self) -> list:
-        """Collect tools from all connected MCP servers."""
+        """Get all tools from all MCP servers."""
         tools = []
-        for client in self.clients.values():
-            tools.extend(client.get_agent_tools())
+        for server_name, client in self.clients.items():
+            for tool_spec in client.list_tools():
+                tools.append({
+                    "name": f"mcp__{server_name}__{tool_spec.get('name', 'unknown')}",
+                    "description": tool_spec.get("description", ""),
+                    "input_schema": tool_spec.get("inputSchema", {"type": "object", "properties": {}}),
+                    "source": "mcp",
+                    "server": server_name,
+                })
         return tools
 
 
-def _safe(p: str) -> Path:
-    p = (WORKDIR / p).resolve()
-    if not p.is_relative_to(WORKDIR):
-        raise ValueError(p)
-    return p
+# ========== PluginLoader ==========
+
+class PluginLoader:
+    """Load plugins from .plugins/ directory."""
+
+    def __init__(self, plugins_dir: Path = None):
+        self.plugins_dir = plugins_dir or (WORKDIR / ".plugins")
+        self.manifests = {}
+
+    def scan(self) -> list:
+        """Scan for plugin manifests."""
+        if not self.plugins_dir.exists():
+            return []
+        found = []
+        for manifest_path in self.plugins_dir.glob("**/manifest.json"):
+            try:
+                manifest = json.loads(manifest_path.read_text())
+                self.manifests[manifest.get("name", "unknown")] = manifest
+                found.append(manifest.get("name", "unknown"))
+            except Exception:
+                pass
+        return found
+
+    def get_mcp_servers(self) -> dict:
+        """Get all MCP server configurations."""
+        servers = {}
+        for name, manifest in self.manifests.items():
+            if manifest.get("type") == "mcp":
+                servers[name] = manifest.get("config", {})
+        return servers
 
 
-@tool
-def bash(command: str) -> str:
-    """Run a shell command."""
+# ========== Base Tool Implementations ==========
+
+def safe_path(p: str) -> Path:
+    path = (WORKDIR / p).resolve()
+    if not path.is_relative_to(WORKDIR):
+        raise ValueError(f"Path escapes workspace: {p}")
+    return path
+
+
+def run_bash(command: str) -> str:
     dangerous = ["rm -rf /", "sudo", "shutdown", "reboot", "> /dev/"]
-    if any(item in command for item in dangerous):
+    if any(d in command for d in dangerous):
         return "[Error]: Dangerous command blocked"
     try:
         r = subprocess.run(command, shell=True, cwd=WORKDIR, capture_output=True, text=True, timeout=120)
+        return (r.stdout + r.stderr).strip()[:50000] or "(no output)"
     except subprocess.TimeoutExpired:
         return "[Error]: Timeout (120s)"
-    return (r.stdout + r.stderr).strip() or "(no output)"
 
-
-@tool
-def read_file(path: str, limit: Optional[int] = None) -> str:
-    """Read file contents."""
+def run_read(path: str) -> str:
     try:
-        p = _safe(path)
-        lines = p.read_text().splitlines()
-        if limit and limit < len(lines):
-            lines = lines[:limit] + [f"... ({len(lines) - limit} more lines)"]
-        return "\n".join(lines)
+        return safe_path(path).read_text()[:50000]
     except Exception as e:
         return f"[Error]: {e}"
 
-
-@tool
-def write_file(path: str, content: str) -> str:
-    """Write content to a file."""
+def run_write(path: str, content: str) -> str:
     try:
-        f = _safe(path)
-        f.parent.mkdir(parents=True, exist_ok=True)
-        f.write_text(content)
-        return f"Wrote {len(content)} bytes to {path}"
+        fp = safe_path(path)
+        fp.parent.mkdir(parents=True, exist_ok=True)
+        fp.write_text(content)
+        return f"Wrote {len(content)} bytes"
     except Exception as e:
         return f"[Error]: {e}"
 
-
-@tool
-def edit_file(path: str, old_text: str, new_text: str) -> str:
-    """Replace exact text in a file once."""
+def run_edit(path: str, old_text: str, new_text: str) -> str:
     try:
-        f = _safe(path)
-        content = f.read_text()
-        if old_text not in content:
+        fp = safe_path(path)
+        c = fp.read_text()
+        if old_text not in c:
             return f"[Error]: Text not found in {path}"
-        f.write_text(content.replace(old_text, new_text, 1))
+        fp.write_text(c.replace(old_text, new_text, 1))
         return f"Edited {path}"
     except Exception as e:
         return f"[Error]: {e}"
 
 
-NATIVE_TOOLS = [bash, read_file, write_file, edit_file]
+NATIVE_TOOLS = [
+    {"name": "bash", "description": "Run a shell command.", "input_schema": {"type": "object", "properties": {"command": {"type": "string"}}, "required": ["command"]}},
+    {"name": "read_file", "description": "Read file contents.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]}},
+    {"name": "write_file", "description": "Write content to a file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "content": {"type": "string"}}, "required": ["path", "content"]}},
+    {"name": "edit_file", "description": "Replace exact text in a file.", "input_schema": {"type": "object", "properties": {"path": {"type": "string"}, "old_text": {"type": "string"}, "new_text": {"type": "string"}}, "required": ["path", "old_text", "new_text"]}},
+]
+
+NATIVE_HANDLERS = {
+    "bash": lambda **kw: run_bash(kw["command"]),
+    "read_file": lambda **kw: run_read(kw["path"]),
+    "write_file": lambda **kw: run_write(kw["path"], kw["content"]),
+    "edit_file": lambda **kw: run_edit(kw["path"], kw["old_text"], kw["new_text"]),
+}
+
+
+# ========== MCP Setup ==========
+
 mcp_router = MCPToolRouter()
 plugin_loader = PluginLoader()
 
@@ -343,10 +328,10 @@ def build_tool_pool() -> list:
     """Assemble the complete tool pool: native + MCP tools."""
     all_tools = list(NATIVE_TOOLS)
     mcp_tools = mcp_router.get_all_tools()
-    native_names = {t.name for t in all_tools}
-    for tool in mcp_tools:
-        if tool["name"] not in native_names:
-            all_tools.append(tool)
+    native_names = {t["name"] for t in all_tools}
+    for tool_spec in mcp_tools:
+        if tool_spec["name"] not in native_names:
+            all_tools.append(tool_spec)
     return all_tools
 
 
@@ -354,13 +339,13 @@ def handle_tool_call(tool_name: str, tool_input: dict) -> str:
     """Dispatch to native handler or MCP router."""
     if mcp_router.is_mcp_tool(tool_name):
         return mcp_router.call(tool_name, tool_input)
-    for t in NATIVE_TOOLS:
-        if t.name == tool_name:
-            return t.invoke(tool_input)
-    return f"Unknown tool: {tool_name}"
+    handler = NATIVE_HANDLERS.get(tool_name)
+    if handler:
+        return handler(**tool_input)
+    return f"[Error]: Unknown tool: {tool_name}"
 
 
-def normalize_tool_result(tool_name: str, output: str, intent: dict | None = None) -> str:
+def normalize_tool_result(tool_name: str, output: str, intent: dict = None) -> str:
     intent = intent or permission_gate.normalize(tool_name, {})
     status = "error" if "Error:" in output or "MCP Error:" in output else "ok"
     payload = {
@@ -374,25 +359,54 @@ def normalize_tool_result(tool_name: str, output: str, intent: dict | None = Non
     return json.dumps(payload, indent=2, ensure_ascii=False)
 
 
-tool_node = ToolNode(NATIVE_TOOLS, handle_tool_errors=True)
-model_with_tools = model.bind_tools(NATIVE_TOOLS)
-
+# ========== Agent State ==========
 
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
 
 
-SYSTEM = (
-    f"You are a coding agent at {WORKDIR}. Use tools to solve tasks.\n"
-    "You have both native tools and MCP tools available.\n"
-    "MCP tools are prefixed with mcp__{{server}}__{{tool}}.\n"
-    "All capabilities pass through the same permission gate before execution."
-)
+# ========== Tool Functions (for LangGraph) ==========
+
+@tool
+def bash_tool(command: str) -> str:
+    """Run a shell command."""
+    return run_bash(command)
+
+@tool
+def read_file(path: str) -> str:
+    """Read file contents."""
+    return run_read(path)
+
+@tool
+def write_file(path: str, content: str) -> str:
+    """Write content to a file."""
+    return run_write(path, content)
+
+@tool
+def edit_file(path: str, old_text: str, new_text: str) -> str:
+    """Replace exact text in a file."""
+    return run_edit(path, old_text, new_text)
+
+
+# Use native + MCP tools combined
+all_tools_for_langgraph = NATIVE_TOOLS + mcp_router.get_all_tools()
+tool_node = ToolNode([bash_tool, read_file, write_file, edit_file], handle_tool_errors=True)
+model_with_tools = model.bind_tools(all_tools_for_langgraph)
+
+
+# ========== Graph Nodes ==========
+
+SYSTEM_PROMPT = f"""You are a coding agent at {WORKDIR}. Use tools to solve tasks.
+
+You have both native tools and MCP tools available.
+MCP tools are prefixed with mcp__{{server}}__{{tool}}.
+All capabilities pass through the same permission gate before execution.
+"""
 
 
 def call_model(state: AgentState) -> dict:
-    messages_with_system = [SystemMessage(content=SYSTEM)] + state["messages"]
-    response = model_with_tools.invoke(messages_with_system)
+    messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
+    response = model_with_tools.invoke(messages)
     return {"messages": [response]}
 
 
@@ -406,15 +420,56 @@ def should_continue(state: AgentState) -> Literal["tools", END]:
 workflow = StateGraph(AgentState)
 workflow.add_node("agent", call_model)
 workflow.add_node("tools", tool_node)
-
 workflow.add_edge(START, "agent")
-workflow.add_conditional_edges("agent", should_continue)
 workflow.add_edge("tools", "agent")
+workflow.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
 
 graph = workflow.compile()
 
 
+def run_agent_with_permission(query: str):
+    """Run agent with permission checking for tools."""
+    tools = build_tool_pool()
+    messages = [HumanMessage(content=query)]
+
+    while True:
+        response = model_with_tools.invoke(
+            [SystemMessage(content=SYSTEM_PROMPT)] + messages
+        )
+        messages.append(response)
+
+        if not hasattr(response, 'tool_calls') or not response.tool_calls:
+            break
+
+        results = []
+        for tc in response.tool_calls:
+            decision = permission_gate.check(tc["name"], tc.get("args", {}))
+            try:
+                if decision["behavior"] == "deny":
+                    output = f"[Permission denied]: {decision['reason']}"
+                elif decision["behavior"] == "ask" and not permission_gate.ask_user(
+                    decision["intent"], tc.get("args", {})
+                ):
+                    output = f"[Permission denied by user]: {decision['reason']}"
+                else:
+                    output = handle_tool_call(tc["name"], tc.get("args", {}))
+            except Exception as e:
+                output = f"[Error]: {e}"
+            print(f"> {tc['name']}: {str(output)[:200]}")
+            results.append({
+                "type": "tool_result",
+                "tool_use_id": tc.get("id", ""),
+                "content": normalize_tool_result(tc["name"], str(output), decision.get("intent")),
+            })
+        messages.append(HumanMessage(content=json.dumps(results)))
+
+    response_content = messages[-1]
+    if hasattr(response_content, 'content') and response_content.content:
+        print(f"\nAssistant: {response_content.content}")
+
+
 if __name__ == "__main__":
+    # Scan for plugins
     found = plugin_loader.scan()
     if found:
         print(f"[Plugins loaded: {', '.join(found)}]")
@@ -431,43 +486,33 @@ if __name__ == "__main__":
     mcp_count = len(mcp_router.get_all_tools())
     print(f"[Tool pool: {tool_count} tools ({mcp_count} from MCP)]")
 
-    state: AgentState = {"messages": []}
+    print("MCP Plugin System (phase20)")
+    print("Use /tools to list all available tools")
+    print("Type 'exit' or 'q' to quit\n")
 
     while True:
         try:
-            q = input("\033[36mphase20 >> \033[0m")
+            query = input("\033[36mphase20 >> \033[0m")
         except (EOFError, KeyboardInterrupt):
+            # Cleanup MCP connections
+            for c in mcp_router.clients.values():
+                c.disconnect()
             break
-        if q.strip().lower() in ("q", "exit", ""):
+        if query.strip().lower() in ("q", "exit", ""):
+            for c in mcp_router.clients.values():
+                c.disconnect()
             break
-        if q.strip() == "/tools":
-            for tool in build_tool_pool():
-                name = tool.name if hasattr(tool, 'name') else tool["name"]
-                desc = tool.description if hasattr(tool, 'description') else tool.get("description", "")
-                prefix = "[MCP] " if name.startswith("mcp__") else "       "
-                print(f"  {prefix}{name}: {desc[:60]}")
+        if query.strip() == "/tools":
+            for tool_spec in build_tool_pool():
+                prefix = "[MCP] " if tool_spec["name"].startswith("mcp__") else "       "
+                print(f"  {prefix}{tool_spec['name']}: {tool_spec.get('description', '')[:60]}")
             continue
-        if q.strip() == "/mcp":
+        if query.strip() == "/mcp":
             if mcp_router.clients:
-                for name, c in mcp_router.clients.items():
-                    tools = c.get_agent_tools()
+                for name, client in mcp_router.clients.items():
+                    tools = client.list_tools()
                     print(f"  {name}: {len(tools)} tools")
             else:
                 print("  (no MCP servers connected)")
             continue
-
-        state["messages"].append(HumanMessage(content=q))
-
-        try:
-            state = graph.invoke(state)
-        except Exception as e:
-            if hasattr(state["messages"][-1], "tool_calls"):
-                print(f"[Error]: {e}")
-                state["messages"].append(HumanMessage(content=f"[Error]: {e}"))
-            else:
-                raise
-
-        print()
-
-    for c in mcp_router.clients.values():
-        c.disconnect()
+        run_agent_with_permission(query)
