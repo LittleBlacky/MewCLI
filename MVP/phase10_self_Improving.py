@@ -139,7 +139,7 @@ class MemoryManager:
                 lines.append(f"... (超过 {MAX_INDEX_LINES} 条，已截断)")
                 break
         self.memory_dir.mkdir(parents=True, exist_ok=True)
-        MEMORY_INDEX.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        (self.memory_dir / "MEMORY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
     @staticmethod
     def _parse_frontmatter(text: str) -> Optional[dict]:
