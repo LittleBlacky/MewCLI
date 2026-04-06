@@ -6,19 +6,19 @@ phase19_worktree_task_isolation.py - Worktree + Task Isolation
 Directory-level isolation for parallel task execution.
 Tasks are the control plane and worktrees are the execution plane.
 
-    .tasks/task_12.json
+    .mini-agent-cli/tasks/task_12.json
       {
         "id": 12,
         "subject": "Implement auth refactor",
         "status": "in_progress",
         "worktree": "auth-refactor"
       }
-    .worktrees/index.json
+    .mini-agent-cli/worktrees/index.json
       {
         "worktrees": [
           {
             "name": "auth-refactor",
-            "path": ".../.worktrees/auth-refactor",
+            "path": ".../.mini-agent-cli/worktrees/auth-refactor",
             "branch": "wt/auth-refactor",
             "task_id": 12,
             "status": "active"
@@ -59,7 +59,8 @@ API_KEY = os.getenv("AGENCY_LLM_API_KEY")
 PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
-WORKTREES_DIR = WORKDIR / ".worktrees"
+STORAGE_DIR = WORKDIR / ".mini-agent-cli"
+WORKTREES_DIR = STORAGE_DIR / "worktrees"
 EVENTS_PATH = WORKTREES_DIR / "events.jsonl"
 
 model = init_chat_model(
@@ -364,7 +365,7 @@ class TaskManager:
         return [json.loads(f.read_text()) for f in sorted(self.dir.glob("task_*.json"))]
 
 
-TASKS = TaskManager(WORKDIR / ".tasks")
+TASKS = TaskManager(TASKS_DIR)
 
 
 # ========== Base Tool Implementations ==========

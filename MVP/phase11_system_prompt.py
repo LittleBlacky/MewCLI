@@ -8,7 +8,7 @@ Pipeline:
   1. core instructions
   2. tool listing
   3. skill metadata (from skills/*.md, progressive disclosure)
-  4. memory section (from .memory/*.md)
+  4. memory section (from .mini-agent-cli/.memory/*.md)
   5. MINI_AGENT.md chain (user -> project -> subdir)
   6. dynamic context (date, workdir, model)
 
@@ -40,9 +40,9 @@ API_KEY = os.getenv("AGENCY_LLM_API_KEY")
 PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
-LLM_DIR = WORKDIR / ".mini-agent-cli"
-SKILLS_DIR = LLM_DIR / "skills"
-MEMORY_DIR = LLM_DIR / ".memory"
+STORAGE_DIR = WORKDIR / ".mini-agent-cli"
+SKILLS_DIR = STORAGE_DIR / "skills"
+MEMORY_DIR = STORAGE_DIR / ".memory"
 
 
 model = init_chat_model(

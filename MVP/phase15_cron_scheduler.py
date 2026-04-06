@@ -55,7 +55,8 @@ API_KEY = os.getenv("AGENCY_LLM_API_KEY")
 PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
-SCHEDULED_TASKS_FILE = WORKDIR / ".claude" / "scheduled_tasks.json"
+STORAGE_DIR = WORKDIR / ".mini-agent-cli"
+SCHEDULED_TASKS_FILE = STORAGE_DIR / "scheduled_tasks.json"
 AUTO_EXPIRY_DAYS = 7
 JITTER_MINUTES = [0, 30]
 JITTER_OFFSET_MAX = 4
@@ -122,7 +123,7 @@ class CronScheduler:
     Two persistence modes:
     +--------------------+-------------------------------+
     | session-only       | In-memory list, lost on exit  |
-    | durable            | .claude/scheduled_tasks.json  |
+    | durable            | .mini-agent-cli/scheduled_tasks.json  |
     +--------------------+-------------------------------+
 
     Two trigger modes:
@@ -266,7 +267,7 @@ class CronScheduler:
             self._save_durable()
 
     def _load_durable(self):
-        """Load durable tasks from .claude/scheduled_tasks.json."""
+        """Load durable tasks from .mini-agent-cli/scheduled_tasks.json."""
         if not SCHEDULED_TASKS_FILE.exists():
             return
         try:

@@ -9,7 +9,7 @@ append-only inbox files.
 
 Key insight: "Teammates have names, inboxes, and independent loops."
 
-    .team/config.json                   .team/inbox/
+    .mini-agent-cli/team/config.json              .mini-agent-cli/team/inbox/
     +----------------------------+      +------------------+
     | {"team_name": "default",   |      | alice.jsonl      |
     |  "members": [              |      | bob.jsonl        |
@@ -49,7 +49,8 @@ API_KEY = os.getenv("AGENCY_LLM_API_KEY")
 PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
-TEAM_DIR = WORKDIR / ".team"
+STORAGE_DIR = WORKDIR / ".mini-agent-cli"
+TEAM_DIR = STORAGE_DIR / "team"
 INBOX_DIR = TEAM_DIR / "inbox"
 
 model = init_chat_model(

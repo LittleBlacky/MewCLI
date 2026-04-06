@@ -3,7 +3,7 @@ from __future__ import annotations
 """
 phase13_task_system.py - Tasks (Persistent Task Graph)
 
-Tasks persist as JSON files in .tasks/ so they survive context compression.
+Tasks persist as JSON files in .mini-agent-cli/tasks/ so they survive context compression.
 Each task carries a small dependency graph:
 - blockedBy: what must finish first
 - blocks: what this task unlocks later
@@ -11,7 +11,7 @@ Each task carries a small dependency graph:
 Key insight: Task state survives compression because it lives on disk,
 not only inside the conversation.
 
-    .tasks/
+    .mini-agent-cli/tasks/
       task_1.json  {"id":1, "subject":"...", "status":"completed", ...}
       task_2.json  {"id":2, "blockedBy":[1], "status":"pending", ...}
       task_3.json  {"id":3, "blockedBy":[2], "blocks":[], ...}
@@ -47,7 +47,8 @@ API_KEY = os.getenv("AGENCY_LLM_API_KEY")
 PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
-TASKS_DIR = WORKDIR / ".tasks"
+STORAGE_DIR = WORKDIR / ".mini-agent-cli"
+TASKS_DIR = STORAGE_DIR / "tasks"
 
 model = init_chat_model(
     MODEL_ID,

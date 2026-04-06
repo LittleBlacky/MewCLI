@@ -228,10 +228,10 @@ class MCPToolRouter:
 # ========== PluginLoader ==========
 
 class PluginLoader:
-    """Load plugins from .plugins/ directory."""
+    """Load plugins from .mini-agent-cli/plugins/ directory."""
 
     def __init__(self, plugins_dir: Path = None):
-        self.plugins_dir = plugins_dir or (WORKDIR / ".plugins")
+        self.plugins_dir = plugins_dir or (STORAGE_DIR / "plugins")
         self.manifests = {}
 
     def scan(self) -> list:

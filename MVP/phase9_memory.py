@@ -17,7 +17,7 @@ Do NOT use memory for:
   - secrets
 
 Storage layout:
-  .memory/
+  .mini-agent-cli/.memory/
     MEMORY.md
     prefer_tabs.md
     review_style.md
@@ -57,8 +57,8 @@ API_KEY = os.getenv("AGENCY_LLM_API_KEY")
 PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
-LLM_DIR = WORKDIR / ".mini-agent-cli"
-MEMORY_DIR = LLM_DIR / ".memory"
+STORAGE_DIR = WORKDIR / ".mini-agent-cli"
+MEMORY_DIR = STORAGE_DIR / ".memory"
 MEMORY_INDEX = MEMORY_DIR / "MEMORY.md"
 MEMORY_TYPES = ("user", "feedback", "project", "reference")
 MAX_INDEX_LINES = 200

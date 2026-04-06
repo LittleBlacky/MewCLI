@@ -56,7 +56,8 @@ API_KEY = os.getenv("AGENCY_LLM_API_KEY")
 PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
-RUNTIME_DIR = WORKDIR / ".runtime-tasks"
+STORAGE_DIR = WORKDIR / ".mini-agent-cli"
+RUNTIME_DIR = STORAGE_DIR / "runtime-tasks"
 RUNTIME_DIR.mkdir(exist_ok=True)
 
 STALL_THRESHOLD_S = 45  # seconds before a task is considered stalled

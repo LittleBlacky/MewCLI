@@ -23,7 +23,7 @@ identity re-injection after context compression.
     +---+----+
         |
         +---> check inbox -> message? -> resume WORK
-        +---> scan .tasks/ -> unclaimed? -> claim -> resume WORK
+        +---> scan .mini-agent-cli/tasks/ -> unclaimed? -> claim -> resume WORK
         +---> timeout (60s) -> shutdown
 
 Key insight: "An idle teammate can safely claim ready work instead of waiting
@@ -62,9 +62,10 @@ API_KEY = os.getenv("AGENCY_LLM_API_KEY")
 PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
-TEAM_DIR = WORKDIR / ".team"
+STORAGE_DIR = WORKDIR / ".mini-agent-cli"
+TEAM_DIR = STORAGE_DIR / "team"
 INBOX_DIR = TEAM_DIR / "inbox"
-TASKS_DIR = WORKDIR / ".tasks"
+TASKS_DIR = STORAGE_DIR / "tasks"
 POLL_INTERVAL = 5
 IDLE_TIMEOUT = 60
 

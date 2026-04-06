@@ -40,8 +40,8 @@ PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 WORKDIR = Path.cwd()
 HOOK_EVENTS = ("PreToolUse", "PostToolUse", "SessionStart")
 HOOK_TIMEOUT = 30
-LLM_DIR = WORKDIR / ".mini-agent-cli"
-TRUST_MARKER = WORKDIR / ".mini-agent-cli" / ".trusted"
+STORAGE_DIR = WORKDIR / ".mini-agent-cli"
+TRUST_MARKER = STORAGE_DIR / ".trusted"
 SYSTEM = f"You are a coding agent at {WORKDIR}. Use tools to solve tasks."
 
 
@@ -52,7 +52,7 @@ class HookManager:
     def __init__(self, config_path: Path = None, sdk_mode: bool = False):
         self.hooks = {"PreToolUse": [], "PostToolUse": [], "SessionStart": []}
         self._sdk_mode = sdk_mode
-        config_path = config_path or (LLM_DIR / ".hooks.json")
+        config_path = config_path or (STORAGE_DIR / ".hooks.json")
         if config_path.exists():
             try:
                 config = json.loads(config_path.read_text())

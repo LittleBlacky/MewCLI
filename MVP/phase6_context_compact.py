@@ -28,11 +28,11 @@ API_KEY = os.getenv("AGENCY_LLM_API_KEY")
 PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
-LLM_DIR = WORKDIR / ".mini-agent-cli"
+STORAGE_DIR = WORKDIR / ".mini-agent-cli"
 SYSTEM = f"You are a coding agent at {WORKDIR}. Keep working step by step, and use compact if the conversation gets too long."
 CONTEXT_LIMIT, KEEP_RECENT, PERSIST_THRESHOLD, PREVIEW_CHARS = 50000, 3, 30000, 2000
-TRANSCRIPT_DIR = LLM_DIR / "transcripts"
-TOOL_RESULTS_DIR = LLM_DIR / "task_outputs" / "tool-results"
+TRANSCRIPT_DIR = STORAGE_DIR / "transcripts"
+TOOL_RESULTS_DIR = STORAGE_DIR / "task_outputs" / "tool-results"
 
 
 # ---------- helpers ----------

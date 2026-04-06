@@ -44,7 +44,8 @@ API_KEY = os.getenv("AGENCY_LLM_API_KEY")
 PROVIDER = os.getenv("AGENCY_LLM_PROVIDER", "openai")
 
 WORKDIR = Path.cwd()
-TEAM_DIR = WORKDIR / ".team"
+STORAGE_DIR = WORKDIR / ".mini-agent-cli"
+TEAM_DIR = STORAGE_DIR / "team"
 INBOX_DIR = TEAM_DIR / "inbox"
 REQUESTS_DIR = TEAM_DIR / "requests"
 
@@ -127,7 +128,7 @@ BUS = MessageBus(INBOX_DIR)
 class RequestStore:
     """
     Durable request records for protocol workflows.
-    Keeps one JSON file per request_id under .team/requests/.
+    Keeps one JSON file per request_id under .mini-agent-cli/team/requests/.
     Protocol state survives to allow inspection, resume, or reconciliation.
     """
 
