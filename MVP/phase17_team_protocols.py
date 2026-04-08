@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 """
-phase17_team_protocols.py - Team Protocols
+phase17_team_protocols.py - Team Protocols with LangGraph Native Patterns
 
 Structured handshakes between models using request_id correlation.
 Implements shutdown protocol and plan approval protocol.
@@ -12,10 +12,10 @@ Implements shutdown protocol and plan approval protocol.
 Key insight: "One request/response shape can support multiple kinds of team workflow.
 Protocol requests are structured workflow objects, not normal free-form chat."
 
-LangGraph concepts:
-- Use RequestStore for durable protocol state
-- MessageBus for protocol envelope delivery
-- Structured request/response with correlation IDs
+LangGraph native patterns:
+- MemorySaver checkpointer for session persistence
+- State updates for protocol tracking
+- RequestStore for durable protocol state with correlation IDs
 """
 import json
 import os
@@ -30,6 +30,7 @@ from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -234,7 +235,10 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
 # ========== Agent State ==========
 
 class AgentState(TypedDict):
+    """Agent state with langgraph native checkpoint support."""
     messages: Annotated[list, add_messages]
+    pending_requests: list[dict]  # LangGraph native: track pending protocol requests
+    inbox_notifications: list[dict]  # LangGraph native: incoming protocol messages
 
 
 # ========== Tool Functions ==========
@@ -400,17 +404,19 @@ Available protocol operations:
 - list_requests(): List all requests
 
 Protocols use request_id correlation for durable handshakes.
+LangGraph native: Checkpoint persistence, state-based protocol tracking.
 """
 
 
 def call_model(state: AgentState) -> dict:
-    """Call the model with current messages."""
+    """Call the model with current messages, draining inbox notifications.
+    LangGraph native: uses state for protocol message injection."""
     messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
 
-    # Check for incoming protocol messages
-    inbox = BUS.read_inbox("lead")
-    if inbox:
-        for msg in inbox:
+    # Check for incoming protocol messages from state
+    inbox_notifications = state.get("inbox_notifications", [])
+    if inbox_notifications:
+        for msg in inbox_notifications:
             msg_type = msg.get("type", "message")
             if msg_type in ("shutdown_response", "plan_approval_response"):
                 request_id = msg.get("request_id", "")
@@ -424,7 +430,7 @@ def call_model(state: AgentState) -> dict:
                 print(f"[Inbox] {msg_type} from {msg.get('from')}: {msg.get('content', '')[:100]}")
 
     response = model_with_tools.invoke(messages)
-    return {"messages": [response]}
+    return {"messages": [response], "inbox_notifications": []}
 
 
 def should_continue(state: AgentState) -> Literal["tools", END]:
@@ -435,7 +441,7 @@ def should_continue(state: AgentState) -> Literal["tools", END]:
     return END
 
 
-# Build the graph
+# Build the graph with checkpoint (LangGraph native)
 workflow = StateGraph(AgentState)
 workflow.add_node("agent", call_model)
 workflow.add_node("tools", tool_node)
@@ -448,14 +454,38 @@ workflow.add_conditional_edges(
     {"tools": "tools", END: END}
 )
 
-graph = workflow.compile()
+# Compile with checkpoint for session persistence (LangGraph native)
+checkpointer = MemorySaver()
+graph = workflow.compile(checkpointer=checkpointer)
 
 
-def run_agent(query: str):
-    """Run the agent with a query."""
-    initial_state = {"messages": [HumanMessage(content=query)]}
+def get_session_config(thread_id: str) -> dict:
+    """LangGraph native: Get session config for checkpointing."""
+    return {"configurable": {"thread_id": thread_id}}
 
-    for event in graph.stream(initial_state):
+
+def run_agent(query: str, thread_id: str = "protocol_session_1") -> dict:
+    """Run the agent with checkpoint support for session persistence."""
+    config = get_session_config(thread_id)
+
+    # Check for existing state
+    existing = graph.get_state(config)
+    existing_msgs = existing.values.get("messages", []) if existing else []
+    existing_requests = existing.values.get("pending_requests", []) if existing else []
+
+    # Check inbox for any new protocol messages
+    inbox = BUS.read_inbox("lead")
+    inbox_notifications = existing.values.get("inbox_notifications", []) if existing else []
+    if inbox:
+        inbox_notifications = inbox_notifications + inbox
+
+    initial_state = {
+        "messages": [HumanMessage(content=query)],
+        "pending_requests": existing_requests,
+        "inbox_notifications": inbox_notifications,
+    }
+
+    for event in graph.stream(initial_state, config):
         node_name = list(event.keys())[0]
         if node_name == "agent":
             response = event[node_name]["messages"][-1]
@@ -466,13 +496,22 @@ def run_agent(query: str):
 
 
 if __name__ == "__main__":
-    print("Team Protocols (phase17)")
+    thread_id = "protocol_session_1"
+    config = get_session_config(thread_id)
+
+    # Resume from checkpoint
+    existing = graph.get_state(config)
+    if existing and existing.values.get("messages"):
+        print(f"[Resuming session {thread_id} with {len(existing.values['messages'])} messages]\n")
+
+    print("Team Protocols (phase17) - LangGraph Native Patterns")
+    print("Features: Checkpoint persistence, state-based protocol tracking")
     print("Use shutdown_request and plan_approval for structured workflows")
-    print("Type 'exit' or 'q' to quit\n")
+    print("Type 'exit' or 'q' to quit, '/requests' to list protocol requests\n")
 
     while True:
         try:
-            query = input("\033[36mphase17 >> \033[0m")
+            query = input(f"\033[36m{thread_id} >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
@@ -480,4 +519,4 @@ if __name__ == "__main__":
         if query.strip() == "/requests":
             print(REQUESTS.list_all())
             continue
-        run_agent(query)
+        run_agent(query, thread_id)
