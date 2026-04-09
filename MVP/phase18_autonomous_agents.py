@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 """
-phase18_autonomous_agents.py - Autonomous Agents
+phase18_autonomous_agents.py - Autonomous Agents with LangGraph Native Patterns
 
 Idle cycle with task board polling, auto-claiming unclaimed tasks, and
 identity re-injection after context compression.
@@ -29,11 +29,10 @@ identity re-injection after context compression.
 Key insight: "An idle teammate can safely claim ready work instead of waiting
 for every assignment from the lead."
 
-LangGraph concepts:
-- Use TaskManager for task board operations
-- MessageBus for inbox communication
-- Autonomous polling with idle timeout
-- Identity re-injection after context compression
+LangGraph native patterns:
+- MemorySaver checkpointer for session persistence
+- State updates for team status tracking
+- Checkpoint-based session resume for autonomous loops
 """
 import json
 import os
@@ -48,6 +47,7 @@ from dotenv import load_dotenv
 from langchain.chat_models import init_chat_model
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_core.tools import tool
+from langgraph.checkpoint.memory import MemorySaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
@@ -400,7 +400,11 @@ def _run_edit(path: str, old_text: str, new_text: str) -> str:
 # ========== Agent State ==========
 
 class AgentState(TypedDict):
+    """Agent state with langgraph native checkpoint support."""
     messages: Annotated[list, add_messages]
+    team_status: dict  # LangGraph native: track teammate statuses
+    inbox_notifications: list[dict]  # LangGraph native: inbox messages for injection
+    spawned_teammates: list[str]  # LangGraph native: track active teammates
 
 
 # ========== Tool Functions ==========
@@ -471,16 +475,24 @@ Available operations:
 - task_list(): Show all tasks
 
 Autonomous teammates poll for unclaimed work when idle.
+LangGraph native: Checkpoint persistence, state-based team tracking.
 """
 
 
 def call_model(state: AgentState) -> dict:
+    """Call the model with current messages and state-based notifications."""
     messages = [SystemMessage(content=SYSTEM_PROMPT)] + state["messages"]
-    inbox = BUS.read_inbox("lead")
-    if inbox:
-        messages.append(HumanMessage(content=f"<inbox>{json.dumps(inbox, indent=2)}</inbox>"))
+
+    # Inject inbox notifications from state
+    inbox_notifications = state.get("inbox_notifications", [])
+    if inbox_notifications:
+        messages.append(HumanMessage(content=f"<inbox>{json.dumps(inbox_notifications, indent=2)}</inbox>"))
+
+    # Update team status from TeammateManager
+    team_status = {m["name"]: m["status"] for m in TEAM.config.get("members", [])}
+
     response = model_with_tools.invoke(messages)
-    return {"messages": [response]}
+    return {"messages": [response], "team_status": team_status, "inbox_notifications": []}
 
 
 def should_continue(state: AgentState) -> Literal["tools", END]:
@@ -490,6 +502,7 @@ def should_continue(state: AgentState) -> Literal["tools", END]:
     return END
 
 
+# Build the graph with checkpoint (LangGraph native)
 workflow = StateGraph(AgentState)
 workflow.add_node("agent", call_model)
 workflow.add_node("tools", tool_node)
@@ -497,12 +510,39 @@ workflow.add_edge(START, "agent")
 workflow.add_edge("tools", "agent")
 workflow.add_conditional_edges("agent", should_continue, {"tools": "tools", END: END})
 
-graph = workflow.compile()
+# Compile with checkpoint for session persistence (LangGraph native)
+checkpointer = MemorySaver()
+graph = workflow.compile(checkpointer=checkpointer)
 
 
-def run_agent(query: str):
-    initial_state = {"messages": [HumanMessage(content=query)]}
-    for event in graph.stream(initial_state):
+def get_session_config(thread_id: str) -> dict:
+    """LangGraph native: Get session config for checkpointing."""
+    return {"configurable": {"thread_id": thread_id}}
+
+
+def run_agent(query: str, thread_id: str = "autonomous_session_1") -> dict:
+    """Run the agent with checkpoint support for session persistence."""
+    config = get_session_config(thread_id)
+
+    # Check existing state
+    existing = graph.get_state(config)
+    existing_msgs = existing.values.get("messages", []) if existing else []
+    existing_team = existing.values.get("spawned_teammates", []) if existing else []
+
+    # Check inbox for new messages
+    inbox = BUS.read_inbox("lead")
+    inbox_notifications = existing.values.get("inbox_notifications", []) if existing else []
+    if inbox:
+        inbox_notifications = inbox_notifications + inbox
+
+    initial_state = {
+        "messages": [HumanMessage(content=query)],
+        "team_status": {},
+        "inbox_notifications": inbox_notifications,
+        "spawned_teammates": existing_team,
+    }
+
+    for event in graph.stream(initial_state, config):
         node_name = list(event.keys())[0]
         if node_name == "agent":
             response = event[node_name]["messages"][-1]
@@ -511,13 +551,22 @@ def run_agent(query: str):
 
 
 if __name__ == "__main__":
-    print("Autonomous Agents (phase18)")
+    thread_id = "autonomous_session_1"
+    config = get_session_config(thread_id)
+
+    # Resume from checkpoint
+    existing = graph.get_state(config)
+    if existing and existing.values.get("messages"):
+        print(f"[Resuming session {thread_id} with {len(existing.values['messages'])} messages]\n")
+
+    print("Autonomous Agents (phase18) - LangGraph Native Patterns")
+    print("Features: Checkpoint persistence, state-based team tracking")
     print("Teammates auto-claim tasks when idle")
-    print("Type 'exit' or 'q' to quit\n")
+    print("Type 'exit' or 'q' to quit, '/team' to list teammates\n")
 
     while True:
         try:
-            query = input("\033[36mphase18 >> \033[0m")
+            query = input(f"\033[36m{thread_id} >> \033[0m")
         except (EOFError, KeyboardInterrupt):
             break
         if query.strip().lower() in ("q", "exit", ""):
@@ -525,4 +574,4 @@ if __name__ == "__main__":
         if query.strip() == "/team":
             print(TEAM.list_all())
             continue
-        run_agent(query)
+        run_agent(query, thread_id)
