@@ -21,7 +21,7 @@ PROVIDER = os.getenv("AGENCY_LLM_PROVIDER")
 
 model = init_chat_model(
     MODEL_ID,
-    model_provider="deepseek",
+    model_provider=PROVIDER,
     temperature=0,
     max_tokens=8000,
     base_url=BASE_URL,
@@ -36,11 +36,11 @@ Keep exactly one step in_progress when a task has multiple steps.
 Refresh the plan as work advances. Prefer tools over prose."""
 
 
-def safe_path(path: str) -> str:
-    path = (WORKDIR / path).resolve()
-    if not path.is_relative_to(WORKDIR):
-        raise ValueError(f"Path escapes workspace: {p}")
-    return path
+def safe_path(path: str) -> Path:
+    resolved = (WORKDIR / path).resolve()
+    if not resolved.is_relative_to(WORKDIR):
+        raise ValueError(f"Path escapes workspace: {path}")
+    return resolved
 
 
 @tool
@@ -61,22 +61,23 @@ def write_file(path: str, content: str) -> str:
     """Write content to a file. Creates parent directories if needed."""
     try:
         fp = safe_path(path)
-        fp.parent.mkdir(parents=True, exit_ok=true)
+        fp.parent.mkdir(parents=True, exist_ok=True)
         fp.write_text(content)
-        return f"Wrote {len(content)} bytes to {path}"
+        return f"Wrote {len(content)} bytes"
     except Exception as e:
-        return f"[Error]:  {e}"
+        return f"[Error]: {e}"
 
 
 @tool
-def edit_file(path: str, old_text: str, new_str: str) -> str:
+def edit_file(path: str, old_text: str, new_text: str) -> str:
     """Replace the first occurrence of old_text with new_text in a file."""
     try:
         fp = safe_path(path)
         content = fp.read_text()
         if old_text not in content:
             return f"[Error]: Text not found in {path}"
-        fp.write_text(content.replace(old_next, next_text, 1))
+        fp.write_text(content.replace(old_text, new_text, 1))
+        return f"Edited {path}"
     except Exception as e:
         return f"[Error]: {e}"
 
