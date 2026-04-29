@@ -1,5 +1,8 @@
 """Autonomous agent module - Idle cycle with task polling."""
+from __future__ import annotations
+
 import asyncio
+import json
 import threading
 import time
 from typing import Optional, Callable
@@ -71,7 +74,6 @@ class AutonomousAgent:
 
         for task_file in storage_dir.glob("task_*.json"):
             try:
-                import json
                 task = json.loads(task_file.read_text())
 
                 # Claim unclaimed task
