@@ -1,77 +1,82 @@
-"""Main entry point for minicode CLI."""
-import argparse
-import asyncio
-import os
+"""CLI Entry Point"""
 import sys
+import asyncio
 from pathlib import Path
+import argparse
 
-from minicode.agent.runner import AgentRunner
-from minicode.repl.repl import start_repl
-from minicode.services.config import get_config_manager
-
-
-def get_workdir(args: argparse.Namespace) -> Path:
-    """Determine working directory."""
-    if args.workdir:
-        return Path(args.workdir).resolve()
-    return Path.cwd()
+from minicode.agent.runner import AgentRunner, run_interactive
+from minicode.agent.session import SessionConfig
 
 
-async def run_single(runner: AgentRunner, prompt: str, workdir: Path) -> None:
-    """Run a single prompt."""
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="MiniCode - Claude-style coding agent",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  minicode --help                    Show this help
+  minicode --task "fix the bug"     Run a single task
+  minicode --interactive            Start interactive REPL
+  minicode --model claude-3-opus    Use different model
+  minicode --workdir /path/to/proj   Set working directory
+        """,
+    )
+    parser.add_argument("task", nargs="?", help="Task to execute")
+    parser.add_argument("--interactive", "-i", action="store_true", help="Start interactive mode")
+    parser.add_argument("--model", "-m", default="claude-sonnet-4-7", help="Model name (default: claaude-sonnet-4-7)")
+    parser.add_argument("--provider", "-p", default="anthropic", help="Model provider (default: anthropic)")
+    parser.add_argument("--workdir", "-w", type=Path, help="Working directory")
+    parser.add_argument("--session", "-s", default="default", help="Session ID")
+    parser.add_argument("--no-checkpoint", action="store_true", help="Disable checkpoint")
+    parser.add_argument("--db", help="SQLite DB path for checkpointing")
+    return parser.parse_args()
+
+
+async def run_task(runner: AgentRunner, task: str) -> None:
+    """Run a single task."""
     from langchain_core.messages import HumanMessage
 
-    os.chdir(workdir)
-    messages = [HumanMessage(content=prompt)]
+    print(f"\n[会话: {runner.thread_id}] {task}\n")
+
+    messages = [HumanMessage(content=task)]
     result = await runner.run(messages)
-    print(result)
+
+    # Print last assistant message
+    msgs = result.get("messages", [])
+    for msg in reversed(msgs):
+        if hasattr(msg, "content") and msg.content:
+            print(f"\n{msg.content}")
+            break
 
 
-async def run_repl(runner: AgentRunner, workdir: Path) -> None:
-    """Run interactive REPL."""
-    os.chdir(workdir)
-    await start_repl(runner)
+def main():
+    args = parse_args()
 
+    # Interactive mode
+    if args.interactive or not args.task:
+        print("Starting MiniCode Interactive Mode...")
+        print(f"Model: {args.model}")
+        print("Commands: /help, /stats, /memory, /dream, /quit")
+        print("-" * 50)
 
-async def run_tui(runner: AgentRunner, workdir: Path) -> None:
-    """Run Textual TUI."""
-    from minicode.tui.app import run_tui as start_tui
-    os.chdir(workdir)
-    await start_tui(runner)
+        asyncio.run(run_interactive(
+            model_provider=args.provider,
+            model_name=args.model,
+            thread_id=args.session,
+        ))
+        return
 
-
-def main() -> None:
-    parser = argparse.ArgumentParser(description="MiniCode - Claude-style coding agent")
-    parser.add_argument("prompt", nargs="*", help="Single prompt to execute")
-    parser.add_argument("-w", "--workdir", help="Working directory")
-    parser.add_argument("--model", default="claude-sonnet-4-7", help="Model name")
-    parser.add_argument("--provider", default="anthropic", help="Model provider")
-    parser.add_argument("--checkpoint", action="store_true", help="Enable checkpointing")
-    parser.add_argument("-v", "--version", action="store_true", help="Show version")
-    parser.add_argument("--tui", action="store_true", help="Use Textual TUI interface")
-    parser.add_argument("--plain", action="store_true", help="Use plain REPL (no TUI)")
-
-    args = parser.parse_args()
-
-    if args.version:
-        print("MiniCode 0.1.0")
-        sys.exit(0)
-
-    workdir = get_workdir(args)
-
+    # Single task mode
     runner = AgentRunner(
         model_provider=args.provider,
         model_name=args.model,
-        use_checkpoint=args.checkpoint,
+        use_checkpoint=not args.no_checkpoint,
+        db_path=args.db,
+        workdir=args.workdir,
+        thread_id=args.session,
     )
 
-    if args.prompt:
-        prompt = " ".join(args.prompt)
-        asyncio.run(run_single(runner, prompt, workdir))
-    elif args.plain:
-        asyncio.run(run_repl(runner, workdir))
-    else:
-        asyncio.run(run_tui(runner, workdir))
+    asyncio.run(run_task(runner, args.task))
 
 
 if __name__ == "__main__":
