@@ -229,3 +229,19 @@ class SystemPromptBuilder:
         sections.append(self._build_dynamic_context(model_id or "unknown"))
 
         return "\n\n".join(filter(None, sections))
+
+
+def get_system_prompt(workdir: Optional[Path] = None) -> str:
+    """Get system prompt for the agent.
+
+    Args:
+        workdir: Working directory (defaults to cwd)
+
+    Returns:
+        Complete system prompt string
+    """
+    from minicode.tools.registry import ALL_TOOLS
+
+    builder = SystemPromptBuilder(workdir=workdir)
+    model_id = os.environ.get("MODEL_NAME", "claude")
+    return builder.build(tools=ALL_TOOLS, model_id=model_id)

@@ -109,5 +109,15 @@ def bash_tool(command: str) -> str:
     return tools.run(command)
 
 
+def run_bash(command: str) -> str:
+    """Run bash command (for internal use).
+
+    Args:
+        command: Shell command to execute
+    """
+    tools = get_bash_tools()
+    return tools.run(command)
+
+
 # Tool list for registration
 BASH_TOOLS = [bash_tool]

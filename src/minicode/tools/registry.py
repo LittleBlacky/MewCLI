@@ -13,6 +13,7 @@ from minicode.tools.memory_tools import MEMORY_TOOLS
 from minicode.tools.skill_tools import SKILL_TOOLS
 from minicode.tools.permission_tools import PERMISSION_TOOLS
 from minicode.tools.protocol_tools import PROTOCOL_TOOLS
+from minicode.tools.hook_tools import HOOK_TOOLS
 
 
 ALL_TOOLS = (
@@ -30,6 +31,7 @@ ALL_TOOLS = (
     + SKILL_TOOLS
     + PERMISSION_TOOLS
     + PROTOCOL_TOOLS
+    + HOOK_TOOLS
 )
 
 
