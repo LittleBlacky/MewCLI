@@ -1,4 +1,4 @@
-"""Session Manager - 处理上下文压缩、记忆和反思"""
+"""Session Manager - 分层防御的上下文管理"""
 from __future__ import annotations
 
 import json
@@ -10,27 +10,31 @@ from dataclasses import dataclass, field
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 from minicode.tools.memory_tools import MemoryManager
-from minicode.tools.compact_tools import compact_messages, should_compact, get_context_size
+from minicode.tools.compact_tools import compact_messages
 
 
 WORKDIR = Path.cwd()
 STORAGE_DIR = WORKDIR / ".mini-agent-cli"
+OUTPUT_DIR = STORAGE_DIR / "outputs"
 
 # 上下文限制配置
-DEFAULT_CONTEXT_LIMIT = 50000  # 字符数限制
-LLM_MAX_TOKENS = 200000       # LLM 最大上下文（Claude 200K）
+DEFAULT_CONTEXT_LIMIT = 50000  # 字符数限制（用于粗略估计）
+LLM_MAX_TOKENS = 150000       # Claude 200K，预留 50K buffer
+MAX_OUTPUT_CHARS = 15000     # 单条消息超过此长度需要保护
+COMPACT_THRESHOLD_RATIO = 0.7  # 超过 70% 容量就开始压缩
 
 
 @dataclass
 class SessionConfig:
     """会话配置"""
-    compact_threshold: int = 50      # 消息数量阈值，超过则压缩
-    compact_keep_recent: int = 5     # 压缩时保留最近N条消息
-    memory_on_task_complete: bool = True  # 任务完成时保存记忆
-    reflect_on_idle: bool = True     # 空闲时运行反思
-    reflect_interval: int = 10      # 每N轮对话运行一次反思
-    context_limit: int = DEFAULT_CONTEXT_LIMIT  # 上下文大小限制
-    max_retry_on_compact: int = 2   # 压缩后最大重试次数
+    compact_threshold: int = 50      # 消息数量阈值
+    compact_keep_recent: int = 5     # 压缩时保留最近N条
+    memory_on_task_complete: bool = True
+    reflect_on_idle: bool = True
+    reflect_interval: int = 10
+    context_limit: int = DEFAULT_CONTEXT_LIMIT
+    max_output_chars: int = MAX_OUTPUT_CHARS
+    compact_ratio: float = COMPACT_THRESHOLD_RATIO
 
 
 @dataclass
@@ -39,183 +43,238 @@ class SessionMetrics:
     total_turns: int = 0
     total_tools_called: int = 0
     tasks_completed: int = 0
-    context_size: int = 0
     last_compact_turn: int = 0
     last_reflect_turn: int = 0
     session_start: float = field(default_factory=time.time)
-    compact_count: int = 0  # 压缩次数统计
+    compact_count: int = 0
+    output_saved_count: int = 0
 
 
 class ContextOverflowError(Exception):
     """上下文超限异常"""
-    def __init__(self, current_size: int, limit: int):
-        self.current_size = current_size
-        self.limit = limit
-        super().__init__(f"Context size {current_size} exceeds limit {limit}")
+    def __init__(self, message: str = "Context overflow"):
+        super().__init__(message)
 
 
 class SessionManager:
-    """会话管理器 - 负责压缩、记忆、反思的后台处理"""
+    """会话管理器 - 分层防御的上下文管理"""
 
     def __init__(self, config: Optional[SessionConfig] = None):
         self.config = config or SessionConfig()
         self.metrics = SessionMetrics()
         self.memory_manager = MemoryManager()
-        self._compact_retry_count = 0
+        OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
-        # 任务历史用于反思
         self.task_history: list[dict] = []
         self.completed_tasks: list[dict] = []
 
-    # ========== 上下文大小检查 ==========
+    # ========== Layer 1: 输入保护 (Preflight Check) ==========
 
-    def check_context_size(self, messages: list) -> tuple[bool, int]:
-        """检查上下文大小是否超限
+    def estimate_tokens(self, messages: list) -> int:
+        """估算消息列表的 token 数量
 
-        Returns:
-            (is_safe, current_size): 是否安全，当前大小
+        简化估算：中文约2字符=1token，英文约4字符=1token
         """
-        current_size = get_context_size(messages)
-        is_safe = current_size < self.config.context_limit
-        return is_safe, current_size
+        total = 0
+        for msg in messages:
+            if hasattr(msg, "content") and msg.content:
+                text = str(msg.content)
+                # 简单估算
+                total += len(text) // 2
+        return total
+
+    def estimate_output_tokens(self, messages: list) -> int:
+        """估算可能的最大输出（预留空间）"""
+        current = self.estimate_tokens(messages)
+        # 预留 10K tokens 给输出
+        return current + 10000
+
+    def should_precompact(self, messages: list) -> bool:
+        """检查是否应该预压缩"""
+        estimated = self.estimate_output_tokens(messages)
+        limit = LLM_MAX_TOKENS * self.config.compact_ratio
+        return estimated > limit
 
     def preflight_check(self, messages: list) -> list:
-        """运行前检查，返回可以安全发送的消息列表
+        """运行前检查 - 确保输入安全
 
-        如果上下文超限，自动压缩后返回
-        如果压缩后仍然超限，抛出异常
+        返回可以安全发送给 LLM 的消息列表
         """
-        is_safe, current_size = self.check_context_size(messages)
-
-        if is_safe:
+        if not messages:
             return messages
 
-        # 需要压缩
-        compacted = self.compact(messages)
+        # 检查是否需要预压缩
+        if self.should_precompact(messages):
+            messages = self.compact(messages, aggressive=False)
 
         # 再次检查
-        is_safe_after, size_after = self.check_context_size(compacted)
+        estimated = self.estimate_tokens(messages)
+        limit = LLM_MAX_TOKENS * 0.85  # 85% 限制
 
-        if not is_safe_after:
-            # 压缩后仍然超限，尝试更激进的压缩
-            compacted = self.compact(messages, aggressive=True)
+        if estimated > limit:
+            messages = self.compact(messages, aggressive=True)
 
-            is_safe_final, size_final = self.check_context_size(compacted)
-            if not is_safe_final:
-                raise ContextOverflowError(size_final, self.config.context_limit)
+        return messages
 
-        return compacted
+    # ========== Layer 2: 输出保护 (Output Protection) ==========
 
-    # ========== 上下文压缩 ==========
+    def protect_output(self, messages: list) -> list:
+        """保护过长的输出消息
+
+        将过长的消息内容保存到文件，上下文只保留摘要
+        """
+        protected_messages = []
+
+        for msg in messages:
+            # 检查是否是 AI 消息且内容过长
+            if (hasattr(msg, "content") and msg.content and
+                isinstance(msg, AIMessage) and
+                len(msg.content) > self.config.max_output_chars):
+
+                saved_path = self._save_long_output(msg.content)
+                summary = self._summarize_content(msg.content)
+
+                # 创建保护后的消息
+                protected_msg = AIMessage(
+                    content=f"{summary}\n\n[详细内容已保存到: {saved_path}]"
+                )
+                protected_messages.append(protected_msg)
+                self.metrics.output_saved_count += 1
+            else:
+                protected_messages.append(msg)
+
+        return protected_messages
+
+    def _save_long_output(self, content: str) -> str:
+        """保存长输出到文件"""
+        timestamp = int(time.time() * 1000)
+        filename = f"output_{timestamp}.txt"
+        filepath = OUTPUT_DIR / filename
+        filepath.write_text(content, encoding="utf-8")
+        return str(filepath.relative_to(WORKDIR))
+
+    def _summarize_content(self, content: str, max_chars: int = 300) -> str:
+        """生成内容摘要（简化版本）"""
+        # 简单截取前 N 个字符
+        if len(content) <= max_chars:
+            return content
+
+        lines = content.split('\n')
+        summary_lines = []
+        char_count = 0
+
+        for line in lines:
+            if char_count + len(line) > max_chars:
+                break
+            summary_lines.append(line)
+            char_count += len(line)
+
+        result = '\n'.join(summary_lines)
+        if len(content) > len(result):
+            result += f"\n\n... (共 {len(content)} 字符)"
+        return result
+
+    # ========== Layer 3: 周期性压缩 (Periodic Compact) ==========
 
     def check_should_compact(self, messages: list) -> bool:
         """检查是否需要压缩"""
         turn_number = self.metrics.total_turns
         since_last = turn_number - self.metrics.last_compact_turn
 
-        # 条件1：超过压缩阈值
         if len(messages) >= self.config.compact_threshold:
             return True
 
-        # 条件2：超过15轮没压缩
-        if since_last >= 15:
-            return True
-
-        # 条件3：上下文接近限制
-        is_safe, size = self.check_context_size(messages)
-        if not is_safe:
+        if since_last >= 12:
             return True
 
         return False
 
     def compact(self, messages: list, aggressive: bool = False) -> list:
-        """执行上下文压缩
-
-        Args:
-            messages: 消息列表
-            aggressive: 是否激进压缩（保留更少消息）
-        """
+        """执行上下文压缩"""
         keep = 3 if aggressive else self.config.compact_keep_recent
         compacted = compact_messages(messages, keep_recent=keep)
 
-        # 记录指标
         self.metrics.last_compact_turn = self.metrics.total_turns
-        self.metrics.context_size = len(compacted)
         self.metrics.compact_count += 1
 
         return compacted
 
-    def get_context_size(self, messages: list) -> int:
-        """获取当前上下文大小"""
-        return get_context_size(messages)
+    # ========== Layer 4: 错误恢复 (Error Recovery) ==========
 
-    # ========== 运行后处理 ==========
+    def handle_overflow(self, error: Exception, messages: list) -> tuple[list, bool]:
+        """处理上下文溢出错误
+
+        Args:
+            error: 异常对象
+            messages: 当前消息列表
+
+        Returns:
+            (processed_messages, should_retry)
+        """
+        error_str = str(error).lower()
+
+        # 判断是否是上下文相关错误
+        is_overflow = (
+            "context" in error_str or
+            "token" in error_str or
+            "maximum" in error_str or
+            "too long" in error_str or
+            "length" in error_str
+        )
+
+        if is_overflow:
+            # 激进压缩后重试
+            compacted = self.compact(messages, aggressive=True)
+            return compacted, True
+
+        return messages, False
+
+    # ========== 后处理 (Post Run) ==========
 
     def after_run(self, messages: list, had_error: bool = False) -> dict:
-        """运行后处理 - 检查是否需要压缩、反思等"""
+        """运行后处理"""
         self.increment_turn()
 
         result = {
             "actions": [],
-            "context_size": self.get_context_size(messages),
+            "context_size": self.estimate_tokens(messages),
         }
 
         # 检查是否需要压缩
         if self.check_should_compact(messages):
             result["actions"].append("compact")
             result["messages"] = self.compact(messages)
-        else:
-            result["messages"] = messages
 
         # 检查是否需要反思
-        reflect_result = self.run_reflection()
-        if reflect_result["action"] != "skip":
+        if self.check_should_reflect():
             result["actions"].append("reflect")
-            result["reflection"] = reflect_result
-
-        # 如果有错误，进行错误记录
-        if had_error:
-            self.record_error()
+            result["reflection"] = self.run_reflection()
 
         return result
 
     # ========== 记忆系统 ==========
 
-    def record_tool_call(self, tool_name: str, success: bool = True) -> None:
-        """记录工具调用"""
-        self.metrics.total_tools_called += 1
-
     def record_task(self, task: dict) -> None:
         """记录任务"""
-        self.task_history.append({
-            **task,
-            "timestamp": time.time(),
-        })
+        self.task_history.append({**task, "timestamp": time.time()})
 
         if task.get("status") == "completed":
             self.completed_tasks.append({**task, "timestamp": time.time()})
             self.metrics.tasks_completed += 1
 
-            # 任务完成时自动保存记忆
             if self.config.memory_on_task_complete:
                 self._auto_save_memory(task)
 
     def _auto_save_memory(self, task: dict) -> None:
         """自动保存任务记忆"""
         subject = task.get("subject", "Unknown task")
-        description = task.get("description", "")
-        status = task.get("status", "")
+        content = f"""## 任务完成: {subject}
 
-        content = f"""## 任务完成记录
+- 完成时间: {time.strftime('%Y-%m-%d %H:%M')}
+- 状态: {task.get('status', 'unknown')}
 
-- **任务**: {subject}
-- **状态**: {status}
-- **完成时间**: {time.strftime('%Y-%m-%d %H:%M')}
-
-### 描述
-{description}
+描述: {task.get('description', 'N/A')}
 """
-
         self.memory_manager.save(
             name=f"task_{int(time.time())}",
             description=subject,
@@ -237,43 +296,24 @@ class SessionManager:
         """检查是否应该运行反思"""
         if not self.config.reflect_on_idle:
             return False
-
         turn_number = self.metrics.total_turns
         since_last = turn_number - self.metrics.last_reflect_turn
-
         return since_last >= self.config.reflect_interval
 
     def run_reflection(self) -> dict:
         """运行自我反思"""
-        if not self.check_should_reflect():
-            return {"action": "skip", "reason": "not_due"}
-
         self.metrics.last_reflect_turn = self.metrics.total_turns
 
-        # 分析任务历史
-        analysis = self._analyze_patterns()
+        patterns = [f"完成 {len(self.task_history)} 个任务"]
 
-        # 检查是否应该创建技能
         should_create_skill, pattern = self._should_create_skill()
 
         return {
             "action": "reflect",
-            "patterns": analysis,
+            "patterns": patterns,
             "should_create_skill": should_create_skill,
             "skill_pattern": pattern,
-            "metrics": self.get_summary(),
         }
-
-    def _analyze_patterns(self) -> list[str]:
-        """分析任务模式"""
-        patterns = []
-
-        if not self.task_history:
-            return ["暂无任务历史"]
-
-        patterns.append(f"完成 {len(self.task_history)} 个任务")
-
-        return patterns
 
     def _should_create_skill(self) -> tuple[bool, Optional[str]]:
         """检查是否应该创建技能"""
@@ -288,11 +328,7 @@ class SessionManager:
 
         return False, None
 
-    def record_error(self) -> None:
-        """记录错误（用于反思）"""
-        pass
-
-    # ========== 会话统计 ==========
+    # ========== 统计 ==========
 
     def increment_turn(self) -> None:
         """增加对话轮次"""
@@ -304,8 +340,8 @@ class SessionManager:
             "total_turns": self.metrics.total_turns,
             "tasks_completed": self.metrics.tasks_completed,
             "tools_called": self.metrics.total_tools_called,
-            "context_size": self.metrics.context_size,
             "compact_count": self.metrics.compact_count,
+            "output_saved": self.metrics.output_saved_count,
             "session_duration": int(time.time() - self.metrics.session_start),
         }
 
