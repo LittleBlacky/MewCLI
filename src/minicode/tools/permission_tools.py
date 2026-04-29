@@ -114,3 +114,26 @@ def get_permission_rules() -> list[dict]:
         {"mode": _permission_mode},
         {"risk_levels": ["none", "low", "medium", "high", "critical"]},
     ]
+
+
+# LangChain tools for registry
+from langchain_core.tools import tool
+
+
+@tool
+def set_mode(mode: str) -> str:
+    """Set permission mode: 'allow', 'deny', 'prompt'."""
+    set_permission_mode(mode)
+    return f"Permission mode set to: {mode}"
+
+
+@tool
+def check_bash_permission(command: str) -> str:
+    """Check if a bash command is safe to run."""
+    allowed, reason = check_permission(command)
+    if allowed:
+        return f"[OK] Command is safe to execute"
+    return f"[BLOCKED] {reason}"
+
+
+PERMISSION_TOOLS = [set_mode, check_bash_permission]

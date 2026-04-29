@@ -7,7 +7,7 @@ name = "minicode"
 version = "0.1.0"
 description = "A Claude-style terminal coding agent"
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.9"
 dependencies = [
     "langgraph>=0.0.20",
     "langchain-anthropic>=0.1.0",

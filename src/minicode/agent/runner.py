@@ -154,9 +154,10 @@ class AgentRunner:
                 else:
                     final_response += str(event)
         except Exception as e:
-            return f"[Error]: {e}"
+            yield f"[Error]: {e}"
+            return
 
-        return final_response
+        yield final_response
 
     def get_session_state(self, thread_id: str = "default") -> Optional[dict]:
         """Get the current state of a session."""
