@@ -68,6 +68,11 @@ class AgentState(TypedDict):
     scheduled_notifications: list[str]
     active_schedules: list[dict]
 
+    # Memory Layer - 三层架构
+    static_memory: str      # 用户偏好、项目配置
+    session_context: str    # 当前会话状态
+    episodic_memory: str    # 相关经验（按需检索）
+
 
 class TeammateState(TypedDict):
     """State for teammate subgraphs."""

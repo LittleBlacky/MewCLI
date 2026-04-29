@@ -25,6 +25,13 @@ from minicode.services.model_provider import create_provider
 from minicode.utils.system_prompt import get_system_prompt
 from minicode.tools.permission_tools import bash_validator, check_permission
 
+# Import Memory Layer for system prompt injection
+try:
+    from minicode.agent.memory import get_memory_layer
+    HAS_MEMORY_LAYER = True
+except ImportError:
+    HAS_MEMORY_LAYER = False
+
 
 WORKDIR = Path.cwd()
 
@@ -93,9 +100,29 @@ class AgentGraphBuilder:
         self._model_with_tools = None
 
 
-def _build_system_message() -> str:
-    """构建系统提示"""
-    return get_system_prompt(WORKDIR)
+def _build_system_message(state: Optional[AgentState] = None) -> str:
+    """构建系统提示 - 支持记忆层注入"""
+    base_prompt = get_system_prompt(WORKDIR)
+
+    # 如果有 AgentState，尝试注入记忆层
+    if state and HAS_MEMORY_LAYER:
+        parts = [base_prompt]
+
+        # 静态记忆: 用户偏好、项目配置
+        if "static_memory" in state and state["static_memory"]:
+            parts.append(state["static_memory"])
+
+        # 动态记忆: 当前会话状态
+        if "session_context" in state and state["session_context"]:
+            parts.append(state["session_context"])
+
+        # 事件记忆: 相关经验
+        if "episodic_memory" in state and state["episodic_memory"]:
+            parts.append(state["episodic_memory"])
+
+        return "\n\n".join(parts)
+
+    return base_prompt
 
 
 def call_model(state: AgentState) -> dict:
@@ -104,7 +131,8 @@ def call_model(state: AgentState) -> dict:
     if not messages:
         return {"messages": []}
 
-    system_msg = SystemMessage(content=_build_system_message())
+    # 构建系统提示 - 传入 state 以便注入记忆
+    system_msg = SystemMessage(content=_build_system_message(state))
     messages_with_system = [system_msg] + list(messages)
 
     # 获取环境变量中的模型配置
