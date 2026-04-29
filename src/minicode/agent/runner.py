@@ -1,4 +1,4 @@
-"""Agent Runner - 分层防御架构"""
+"""Agent Runner - 分层防御架构 + 记忆层"""
 from __future__ import annotations
 
 import asyncio
@@ -16,19 +16,30 @@ from minicode.agent.session import (
     get_session_manager,
     reset_session_manager,
 )
+from minicode.agent.memory import (
+    MemoryLayer,
+    MemoryEntry,
+    get_memory_layer,
+)
 from minicode.services.checkpoint import CheckpointManager
 from minicode.tools.hook_tools import get_hook_manager
 
 
 class AgentRunner:
-    """Agent 运行器 - 分层防御架构
+    """Agent 运行器 - 四层架构
 
     分层防御策略:
     1. Input Safety - 运行前预检+压缩
-    2. Graph Execution - 轻量循环
-    3. Error Recovery - 溢出时捕获+恢复
+    2. Memory Layer - 检索+注入相关记忆
+    3. Graph Execution - 轻量循环
     4. Output Protection - 过长输出保存文件
     5. Periodic Cleanup - 周期性压缩
+
+    记忆层职责:
+    - 检索相关记忆
+    - 注入到系统提示
+    - 自动保存任务记忆
+    - 周期整合
     """
 
     def __init__(
@@ -45,6 +56,9 @@ class AgentRunner:
         self.use_checkpoint = use_checkpoint
         self.db_path = db_path
         self.workdir = workdir or Path.cwd()
+
+        # 记忆层
+        self.memory = get_memory_layer()
 
         # 会话管理器
         self.session = SessionManager(session_config)
@@ -73,7 +87,7 @@ class AgentRunner:
             for msg in hook_result["messages"]:
                 print(f"[SessionStart] {msg}")
 
-    def _get_initial_state(self, messages: list) -> AgentState:
+    def _get_initial_state(self, messages: list, injected_memories: str = "") -> AgentState:
         """获取初始状态"""
         return {
             "messages": messages,
@@ -109,14 +123,15 @@ class AgentRunner:
             "error_recovery_count": 0,
             "scheduled_notifications": [],
             "active_schedules": [],
+            "injected_memories": injected_memories,  # 注入的记忆
         }
 
     async def run(self, messages: list, thread_id: str = "default") -> dict:
-        """运行 Agent - 分层防御
+        """运行 Agent - 四层架构
 
         Layer 1: Input Safety - 预检+压缩
-        Layer 2: Graph Execution - 轻量执行
-        Layer 3: Error Recovery - 溢出处理
+        Layer 2: Memory Layer - 检索+注入记忆
+        Layer 3: Graph Execution - 轻量执行
         Layer 4: Output Protection - 保护过长输出
         Layer 5: Periodic Cleanup - 周期性压缩
         """
@@ -124,10 +139,20 @@ class AgentRunner:
 
         # Layer 1: Input Safety - 运行前预检
         safe_messages = self.session.preflight_check(messages)
-        initial_state = self._get_initial_state(safe_messages)
+
+        # Layer 2: Memory Layer - 检索相关记忆
+        injected_memories = ""
+        if messages:
+            # 从最后一条用户消息提取查询
+            last_user_msg = messages[-1] if isinstance(messages[-1], HumanMessage) else None
+            if last_user_msg and hasattr(last_user_msg, "content"):
+                query = last_user_msg.content[:200]  # 取前200字符作为查询
+                injected_memories = self.memory.inject_memories(query)
+
+        initial_state = self._get_initial_state(safe_messages, injected_memories)
 
         try:
-            # Layer 2: Graph Execution
+            # Layer 3: Graph Execution
             result = await self.graph.ainvoke(initial_state, config)
 
             # Layer 4: Output Protection - 保护过长输出
@@ -144,45 +169,45 @@ class AgentRunner:
             return result
 
         except Exception as e:
-            # Layer 3: Error Recovery - 处理溢出
+            # Error Recovery
             if self._is_overflow_error(e):
                 print(f"[Warning] Context overflow detected, attempting recovery...")
 
-                # 尝试从 checkpoint 恢复
                 state = self.graph.get_state(config)
                 if state and "messages" in state.values:
                     current_messages = list(state.values["messages"])
                 else:
                     current_messages = safe_messages
 
-                # 压缩后重试
                 compacted = self.session.compact(current_messages, aggressive=True)
                 retry_state = self._get_initial_state(compacted)
 
                 try:
                     result = await self.graph.ainvoke(retry_state, config)
-
-                    # 再次保护输出
                     result_messages = list(result.get("messages", []))
                     result_messages = self.session.protect_output(result_messages)
                     result["messages"] = result_messages
-
                     return result
 
                 except Exception as retry_error:
                     print(f"[Error] Recovery failed: {retry_error}")
                     raise retry_error
 
-            # 非溢出错误，直接抛出
             raise
 
     async def stream(self, messages: list, thread_id: str = "default") -> AsyncIterator[str]:
         """流式运行 Agent"""
         config = self.checkpoint_manager.get_session_config(thread_id)
 
-        # Layer 1: Input Safety
         safe_messages = self.session.preflight_check(messages)
-        initial_state = self._get_initial_state(safe_messages)
+        injected_memories = ""
+        if messages:
+            last_user_msg = messages[-1] if isinstance(messages[-1], HumanMessage) else None
+            if last_user_msg and hasattr(last_user_msg, "content"):
+                query = last_user_msg.content[:200]
+                injected_memories = self.memory.inject_memories(query)
+
+        initial_state = self._get_initial_state(safe_messages, injected_memories)
 
         async for event in self.graph.astream(initial_state, config):
             if isinstance(event, dict):
@@ -201,27 +226,43 @@ class AgentRunner:
         """判断是否是上下文溢出错误"""
         error_str = str(error).lower()
         overflow_indicators = [
-            "context",
-            "token",
-            "maximum",
-            "too long",
-            "length",
-            "exceeds",
-            "context_length_exceeded",
+            "context", "token", "maximum", "too long",
+            "length", "exceeds", "context_length_exceeded",
         ]
         return any(indicator in error_str for indicator in overflow_indicators)
 
+    # ========== Memory Layer API ==========
+
     def get_session_summary(self) -> dict:
         """获取会话摘要"""
-        return self.session.get_summary()
+        summary = self.session.get_summary()
+        summary["memory_stats"] = self.memory.get_stats()
+        return summary
 
     def get_memory(self) -> list:
         """获取记忆列表"""
-        return self.session.list_memory()
+        return self.memory.list_all()
 
     def save_memory(self, name: str, description: str, mem_type: str, content: str) -> str:
         """保存记忆"""
-        return self.session.save_memory(name, description, mem_type, content)
+        return self.memory.save(name, content, mem_type, description)
+
+    def search_memory(self, query: str, memory_type: Optional[str] = None) -> list[dict]:
+        """搜索记忆"""
+        entries = self.memory.retrieve(query, memory_type)
+        return [
+            {
+                "name": e.name,
+                "description": e.description,
+                "type": e.memory_type,
+                "content_preview": e.content[:200],
+            }
+            for e in entries
+        ]
+
+    def consolidate_memory(self) -> dict:
+        """整合记忆"""
+        return self.memory.consolidate()
 
     def compact_now(self) -> dict:
         """手动触发压缩"""
@@ -262,7 +303,7 @@ async def run_interactive(
 
     print(f"MiniCode Interactive Agent")
     print(f"Model: {model_name}")
-    print("Commands: /clear, /history, /state, /memory, /compact, /tokens")
+    print("Commands: /clear, /history, /memory, /search, /compact")
     print("-" * 50)
 
     messages = []
@@ -274,7 +315,6 @@ async def run_interactive(
             print("\nExiting...")
             break
 
-        # 处理命令
         if user_input.startswith("/"):
             parts = user_input.split(maxsplit=1)
             cmd = parts[0].lower()
@@ -289,33 +329,31 @@ async def run_interactive(
                 summary = runner.get_session_summary()
                 print(f"Turns: {summary['total_turns']}, "
                       f"Tasks: {summary['tasks_completed']}, "
-                      f"Tools: {summary['tools_called']}, "
-                      f"Compact: {summary['compact_count']}")
-                continue
-            elif cmd == "/tokens":
-                tokens = runner.session.estimate_tokens(messages)
-                print(f"Estimated tokens: {tokens}")
-                continue
-            elif cmd == "/state":
-                state = runner.get_session_state(thread_id)
-                if state:
-                    msgs = state.values.get("messages", [])
-                    print(f"Session active: {len(msgs)} messages")
-                else:
-                    print("No active session")
+                      f"Memory: {summary.get('memory_stats', {}).get('total', 0)}")
                 continue
             elif cmd == "/memory":
                 mems = runner.get_memory()
                 print(f"Memory entries: {len(mems)}")
                 for m in mems[:5]:
-                    print(f"  - {m.get('name', 'unnamed')}")
+                    print(f"  - [{m['type']}] {m['name']}")
+                continue
+            elif cmd == "/search":
+                if len(parts) > 1:
+                    results = runner.search_memory(parts[1])
+                    print(f"Found {len(results)} memories:")
+                    for r in results:
+                        print(f"  - {r['name']}: {r['content_preview'][:50]}...")
                 continue
             elif cmd == "/compact":
                 result = runner.compact_now()
-                print(f"Compacted: {result.get('original_count', 0)} -> {result.get('compacted_count', 0)} messages")
+                print(f"Compacted: {result.get('original_count', 0)} -> {result.get('compacted_count', 0)}")
+                continue
+            elif cmd == "/consolidate":
+                result = runner.consolidate_memory()
+                print(f"Consolidated: deleted {len(result.get('deleted', []))}, remaining {result.get('remaining', 0)}")
                 continue
             elif cmd == "/help":
-                print("Commands: /clear, /history, /state, /memory, /compact, /tokens, /q")
+                print("Commands: /clear, /history, /memory, /search <query>, /compact, /consolidate, /q")
                 continue
 
         messages.append(HumanMessage(content=user_input))

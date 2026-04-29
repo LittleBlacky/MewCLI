@@ -14,6 +14,7 @@ from minicode.agent.subagent import SubAgent, SubAgentPool
 from minicode.agent.error_recovery import ErrorRecovery, RecoveryManager, ErrorType, RecoveryResult
 from minicode.agent.self_improve import DreamConsolidator, SelfImprovingAgent
 from minicode.agent.autonomous import AutonomousAgent, TeammateManager, IdleConfig
+from minicode.agent.memory import MemoryLayer, MemoryIndex, MemoryEntry, get_memory_layer
 
 __all__ = [
     # Core
@@ -45,4 +46,9 @@ __all__ = [
     # State
     "TeammateState",
     "TodoItem",
+    # Memory layer
+    "MemoryLayer",
+    "MemoryIndex",
+    "MemoryEntry",
+    "get_memory_layer",
 ]
