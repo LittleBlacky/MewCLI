@@ -1,6 +1,7 @@
 """Main agent implementation using LangGraph - 轻量级核心循环"""
 from __future__ import annotations
 
+import asyncio
 import os
 import re
 from pathlib import Path
@@ -53,39 +54,72 @@ def refresh_mcp_tools() -> int:
     Returns:
         获取到的工具数量
     """
-    global _MCP_DYNAMIC_TOOLS, _MCP_TOOL_NODE, TOOL_MAP, TOOL_NODE
+    global _MCP_TOOL_NODE, TOOL_MAP, TOOL_NODE
 
     try:
         from minicode.tools.mcp_tools import get_mcp_client
+        from langchain_core.tools import StructuredTool
+
         client = get_mcp_client()
 
-        # 获取 MCP 工具
+        # 刷新 MCP 客户端的工具列表
+        client.refresh()
+
+        # 直接从客户端获取 MCP 工具
         new_tools = client.get_tools()
 
         if new_tools:
-            _MCP_DYNAMIC_TOOLS = new_tools
+            # 获取本地工具名称列表
+            local_tool_names = {t.name for t in ALL_TOOLS}
+
+            # 处理冲突的 MCP 工具，重命名为 mcp_xxx
+            processed_mcp_tools = []
+            for t in new_tools:
+                if t.name in local_tool_names:
+                    # 创建重命名版本
+                    new_tool = StructuredTool(
+                        name=f"mcp_{t.name}",
+                        description=t.description,
+                        args_schema=t.args_schema,
+                        coroutine=t.coroutine,
+                    )
+                    processed_mcp_tools.append(new_tool)
+                else:
+                    processed_mcp_tools.append(t)
+
+            renamed_count = len([t for t in processed_mcp_tools if t.name.startswith("mcp_")])
+            print(f"[MCP] Added {len(processed_mcp_tools)} tools ({renamed_count} renamed)")
 
             # 更新全局工具映射
             TOOL_MAP = {t.name: t for t in ALL_TOOLS}
-            for t in _MCP_DYNAMIC_TOOLS:
+            for t in processed_mcp_tools:
                 TOOL_MAP[t.name] = t
 
             # 重新创建工具节点（包含 MCP 工具）
-            TOOL_NODE = ToolNode(ALL_TOOLS + _MCP_DYNAMIC_TOOLS, handle_tool_errors=True)
+            TOOL_NODE = ToolNode(ALL_TOOLS + processed_mcp_tools, handle_tool_errors=True)
 
             # 重置模型以包含新工具
             reset_for_mcp_refresh()
 
-            return len(new_tools)
+            return len(processed_mcp_tools)
     except Exception as e:
         print(f"[MCP] Failed to refresh tools: {e}")
+        import traceback
+        traceback.print_exc()
 
     return 0
 
 
 def get_all_tools() -> list[BaseTool]:
     """获取所有可用工具（包括 MCP 动态工具）"""
-    return ALL_TOOLS + _MCP_DYNAMIC_TOOLS
+    # 直接从 MCP 客户端获取工具列表，避免全局变量导入问题
+    try:
+        from minicode.tools.mcp_tools import get_mcp_client
+        client = get_mcp_client()
+        mcp_tools = client.get_tools()
+        return ALL_TOOLS + mcp_tools
+    except Exception:
+        return ALL_TOOLS
 
 
 def get_tool_map() -> dict[str, BaseTool]:
@@ -209,6 +243,42 @@ def call_model(state: AgentState) -> dict:
     return {"messages": [response]}
 
 
+def _run_tool_async(tool, args: dict) -> Any:
+    """在线程池中运行异步工具"""
+    async def _ainvoke():
+        return await tool.ainvoke(args)
+
+    loop = asyncio.new_event_loop()
+    try:
+        return loop.run_until_complete(_ainvoke())
+    finally:
+        loop.close()
+
+
+def _is_async_tool(tool: Any) -> bool:
+    """检查工具是否为异步工具（通过 coroutine 属性判断）"""
+    return hasattr(tool, 'coroutine') and tool.coroutine is not None
+
+
+def _execute_tool(tool: Any, tool_args: dict) -> Any:
+    """执行单个工具（同步或异步）"""
+    try:
+        # 检查是否有 coroutine（异步工具）
+        if _is_async_tool(tool):
+            # 异步工具通过 _run_tool_async 执行
+            return _run_tool_async(tool, tool_args)
+        else:
+            # 同步工具直接调用
+            if hasattr(tool, 'invoke'):
+                return tool.invoke(tool_args)
+            elif hasattr(tool, 'func'):
+                return tool.func(**tool_args)
+            else:
+                return f"[Error] Tool has no invoke or func method"
+    except Exception as e:
+        return f"[Error] {e}"
+
+
 def execute_tools(state: AgentState) -> dict:
     """执行工具 - 核心节点"""
     messages = state.get("messages", [])
@@ -237,21 +307,31 @@ def execute_tools(state: AgentState) -> dict:
                 )
                 continue
 
-        # 执行工具
-        if tool_name in TOOL_MAP:
-            try:
-                result = TOOL_NODE.invoke({"messages": [last_message]})
-                if "messages" in result:
-                    for msg in result["messages"]:
-                        if isinstance(msg, ToolMessage):
-                            tool_messages.append(msg)
-            except Exception as e:
-                tool_messages.append(
-                    ToolMessage(content=f"[Error] {e}", tool_call_id=tool_call_id)
-                )
-        else:
+        # 查找工具
+        tool = TOOL_MAP.get(tool_name)
+        if not tool:
             tool_messages.append(
                 ToolMessage(content=f"[Error] Unknown tool: {tool_name}", tool_call_id=tool_call_id)
+            )
+            continue
+
+        try:
+            # 根据工具类型选择执行方式
+            result = _execute_tool(tool, tool_args)
+
+            # 处理结果
+            if isinstance(result, ToolMessage):
+                result.tool_call_id = tool_call_id
+                tool_messages.append(result)
+            else:
+                # 转换为 ToolMessage
+                content = str(result) if not isinstance(result, str) else result
+                tool_messages.append(
+                    ToolMessage(content=content, tool_call_id=tool_call_id)
+                )
+        except Exception as e:
+            tool_messages.append(
+                ToolMessage(content=f"[Error] {e}", tool_call_id=tool_call_id)
             )
 
     return {"messages": tool_messages, "tool_messages": tool_messages}
@@ -277,6 +357,9 @@ def create_agent_graph(
     """创建轻量级 Agent Graph"""
     builder = AgentGraphBuilder(model_provider, model_name)
     AgentGraphBuilder._instance = builder
+
+    # 初始化时刷新 MCP 工具
+    refresh_mcp_tools()
 
     workflow = StateGraph(AgentState)
 

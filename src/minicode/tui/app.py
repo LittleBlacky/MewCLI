@@ -4,7 +4,7 @@ from datetime import datetime
 from typing import Optional
 
 from textual.app import App, ComposeResult
-from textual.command import Command, CommandHelp, CommandList
+from textual.command import Command, CommandList, Hit, DiscoveryHit
 from textual.containers import Container, VerticalScroll, Horizontal
 from textual.widgets import Header, Footer, Log, Input, RichLog, Static, Button, Label
 from textual.binding import Binding
@@ -360,33 +360,31 @@ class MiniCodeTUI(App):
 
     async def _cmd_memory(self, log: RichLog, args: str) -> None:
         """Show memories."""
-        try:
-            from minicode.tools.memory_tools import get_memories
-            memories = get_memories()
-            if memories:
-                log.write_line("[bold]Saved Memories:[/bold]")
-                for m in memories[:10]:
-                    name = m.get('name', 'unnamed')
-                    created = m.get('created', 'unknown')
-                    log.write_line(f"  - {name} [dim]({created})[/dim]")
-            else:
-                log.write_line("[dim]No memories saved.[/dim]")
-        except ImportError:
-            log.write_line("[dim]Memory system not available.[/dim]")
+        from minicode.tools.memory_tools import get_memory_manager
+        mgr = get_memory_manager()
+        memories = list(mgr.memory_dir.glob("*.md"))
+        # Filter out MEMORY.md
+        memories = [m for m in memories if m.name != "MEMORY.md"]
+
+        if memories:
+            log.write_line("[bold]Saved Memories:[/bold]")
+            for m in memories[:10]:
+                log.write_line(f"  - {m.stem}")
+        else:
+            log.write_line("[dim]No memories saved.[/dim]")
 
     async def _cmd_skills(self, log: RichLog, args: str) -> None:
         """Show skills."""
-        try:
-            from minicode.tools.skill_tools import get_skills
-            skills = get_skills()
-            if skills:
-                log.write_line("[bold]Available Skills:[/bold]")
-                for s in skills:
-                    log.write_line(f"  - {s}")
-            else:
-                log.write_line("[dim]No skills available.[/dim]")
-        except ImportError:
-            log.write_line("[dim]Skill system not available.[/dim]")
+        from minicode.tools.skill_tools import get_skill_manager
+        mgr = get_skill_manager()
+        skills = mgr.list()
+
+        if skills:
+            log.write_line("[bold]Available Skills:[/bold]")
+            for s in skills:
+                log.write_line(f"  - {s['name']}: {s['description']}")
+        else:
+            log.write_line("[dim]No skills available.[/dim]")
 
     async def _cmd_context(self, log: RichLog, args: str) -> None:
         """Show context."""
@@ -451,13 +449,10 @@ class MiniCodeTUI(App):
 
     async def _cmd_tools(self, log: RichLog, args: str) -> None:
         """List tools."""
-        try:
-            from minicode.tools.registry import ALL_TOOLS
-            log.write_line("[bold]Available Tools:[/bold]")
-            for tool_name in sorted(ALL_TOOLS.keys()):
-                log.write_line(f"  - {tool_name}")
-        except ImportError:
-            log.write_line("[dim]Tool registry not available.[/dim]")
+        from minicode.tools.registry import ALL_TOOLS
+        log.write_line(f"[bold]Available Tools ({len(ALL_TOOLS)}):[/bold]")
+        for tool in ALL_TOOLS:
+            log.write_line(f"  - {tool.name}")
 
     async def _cmd_env(self, log: RichLog, args: str) -> None:
         """Show environment."""

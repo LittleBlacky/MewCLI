@@ -4,7 +4,8 @@ import asyncio
 from pathlib import Path
 import argparse
 
-from minicode.agent.runner import AgentRunner, run_interactive
+from minicode.agent.runner import AgentRunner
+from minicode.agent.runner import run_interactive
 from minicode.agent.session import SessionConfig
 
 
@@ -14,21 +15,26 @@ def parse_args():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  minicode --help                    Show this help
-  minicode --task "fix the bug"     Run a single task
-  minicode --interactive            Start interactive REPL
-  minicode --model claude-3-opus    Use different model
-  minicode --workdir /path/to/proj   Set working directory
+  minicode                          Start interactive REPL
+  minicode "fix the bug"            Run a single task
+  minicode --model claude-3-opus   Use different model
+  minicode --workdir /path/to/proj  Set working directory
+  minicode --tui                   Start with Textual TUI (with ASCII cat!)
+
+Tips:
+  @filename  - Reference a file in your message
+  /          - Show all commands
+  /help      - Show help
         """,
     )
     parser.add_argument("task", nargs="?", help="Task to execute")
-    parser.add_argument("--interactive", "-i", action="store_true", help="Start interactive mode")
     parser.add_argument("--model", "-m", default="claude-sonnet-4-7", help="Model name (default: claaude-sonnet-4-7)")
     parser.add_argument("--provider", "-p", default="anthropic", help="Model provider (default: anthropic)")
     parser.add_argument("--workdir", "-w", type=Path, help="Working directory")
     parser.add_argument("--session", "-s", default="default", help="Session ID")
     parser.add_argument("--no-checkpoint", action="store_true", help="Disable checkpoint")
     parser.add_argument("--db", help="SQLite DB path for checkpointing")
+    parser.add_argument("--tui", "-t", action="store_true", help="Start with Textual TUI (with ASCII cat)")
     return parser.parse_args()
 
 
@@ -52,11 +58,26 @@ async def run_task(runner: AgentRunner, task: str) -> None:
 def main():
     args = parse_args()
 
-    # Interactive mode
-    if args.interactive or not args.task:
+    # TUI mode
+    if args.tui:
+        print("Starting MiniCode TUI Mode...")
+        from minicode.tui.app import run_tui
+        runner = AgentRunner(
+            model_provider=args.provider,
+            model_name=args.model,
+            use_checkpoint=not args.no_checkpoint,
+            workdir=args.workdir,
+            thread_id=args.session,
+        )
+        asyncio.run(run_tui(runner))
+        return
+
+    # Interactive mode (no task provided)
+    if not args.task:
         print("Starting MiniCode Interactive Mode...")
         print(f"Model: {args.model}")
-        print("Commands: /help, /stats, /memory, /dream, /quit")
+        print("@filename - Reference files")
+        print("/          - Show commands")
         print("-" * 50)
 
         asyncio.run(run_interactive(

@@ -1,7 +1,6 @@
 """Textual TUI commands and keybindings."""
 from textual.app import App, ComposeResult
-from textual.command import Command, CommandHelp, Hit, Hits, Provider
-from textual.keymap import Keymap
+from textual.command import Command, Hit, Hits, Provider
 from textual.widgets import Header, Footer
 
 from minicode.agent.runner import AgentRunner
@@ -45,8 +44,7 @@ class MiniCodeCommands(Provider):
             if query.lower() in name.lower() or query.lower() in description.lower():
                 yield Hit(
                     0,
-                    name,
-                    f"{description}\n{detail}",
+                    Command(f"/{name} - {description}", f"{detail}"),
                     self.app.action_run_command,
                 )
 

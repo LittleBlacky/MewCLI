@@ -2,8 +2,9 @@
 from __future__ import annotations
 
 import asyncio
-import concurrent.futures
 import json
+import threading
+import time
 from pathlib import Path
 from typing import Optional, Any
 
@@ -12,14 +13,55 @@ from langchain_core.tools import tool
 WORKDIR = Path.cwd()
 STORAGE_DIR = WORKDIR / ".mini-agent-cli"
 
-# 线程池用于异步执行
-_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
+
+class _EventLoopHolder:
+    """持有持久化事件循环的类."""
+    _instance: Optional["_EventLoopHolder"] = None
+    _lock = threading.Lock()
+
+    def __init__(self):
+        self.loop: Optional[asyncio.AbstractEventLoop] = None
+        self.thread: Optional[threading.Thread] = None
+        self._started = False
+
+    @classmethod
+    def get_instance(cls) -> "_EventLoopHolder":
+        with cls._lock:
+            if cls._instance is None:
+                cls._instance = cls()
+            return cls._instance
+
+    def get_loop(self) -> asyncio.AbstractEventLoop:
+        with self._lock:
+            if self.loop is None or self.loop.is_closed():
+                self._start_loop()
+            return self.loop
+
+    def _start_loop(self):
+        """启动事件循环线程."""
+        if self._started:
+            return
+
+        def run_loop():
+            self.loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(self.loop)
+            self.loop.run_forever()
+
+        self.thread = threading.Thread(target=run_loop, daemon=True)
+        self.thread.start()
+        self._started = True
+
+        # 等待循环就绪
+        while self.loop is None or not self.loop.is_running():
+            time.sleep(0.01)
 
 
 def _run_async(coro):
-    """在独立线程中运行协程，避免事件循环冲突"""
-    future = _executor.submit(asyncio.run, coro)
-    return future.result(timeout=60)
+    """在持久化事件循环中运行协程."""
+    holder = _EventLoopHolder.get_instance()
+    loop = holder.get_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=120)
 
 
 class MultiServerMCP:
@@ -72,7 +114,8 @@ class MultiServerMCP:
                     connections[name] = StreamableHttpConnection(url=config.get("url", ""), transport="http")
 
             self._client = MultiServerMCPClient(connections=connections or None)
-            self._tools = await self._client.get_tools()
+            # 不要在这里调用 get_tools()，这会导致多个服务器时挂起
+            # 让用户显式调用 refresh() 来获取工具
 
     def _connect_sync(self, name: str, config: dict) -> str:
         """同步连接方法，在线程池中执行"""
@@ -91,8 +134,9 @@ class MultiServerMCP:
         self._save_config()
 
         try:
+            # 只初始化客户端，不获取工具（避免多服务器挂起）
             await self._ensure_client()
-            return f"[MCP] Connected to {name}, {len(self._tools)} tools available"
+            return f"[MCP] Connected to {name} (call mcp_refresh to load tools)"
         except Exception as e:
             if name in self._servers:
                 del self._servers[name]
@@ -134,7 +178,13 @@ class MultiServerMCP:
 
     async def _refresh_async(self) -> int:
         """刷新工具列表（异步实现）"""
-        await self._ensure_client()
+        if self._client is None:
+            await self._ensure_client()
+
+        # 获取工具
+        if self._client is not None:
+            self._tools = await self._client.get_tools()
+
         return len(self._tools)
 
 

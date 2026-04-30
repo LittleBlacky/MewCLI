@@ -1,5 +1,5 @@
 """Checkpoint management for session persistence."""
-from typing import Optional
+from typing import Optional, Union
 
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.checkpoint.sqlite import SqliteSaver
@@ -41,7 +41,7 @@ class CheckpointManager:
 def create_checkpointer(
     use_sqlite: bool = False,
     db_path: Optional[str] = None,
-) -> MemorySaver | SqliteSaver:
+) -> Union[MemorySaver, SqliteSaver]:
     """Factory function to create a checkpointer."""
     if use_sqlite and db_path:
         return SqliteSaver.from_conn_string(db_path)

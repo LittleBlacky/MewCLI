@@ -1,13 +1,31 @@
-"""REPL interface for interactive mode - Enhanced version."""
+"""REPL interface for interactive mode - Enhanced version with @ file and / command support."""
 import asyncio
+import glob
+import os
+import re
 import sys
+from pathlib import Path
 from typing import Optional
+
+try:
+    import readline
+    HAS_READLINE = True
+except ImportError:
+    HAS_READLINE = False
+
+try:
+    from rich.console import Console
+    from rich.panel import Panel
+    from rich.table import Table
+    HAS_RICH = True
+except ImportError:
+    HAS_RICH = False
 
 from langchain_core.messages import HumanMessage
 
 
 class REPL:
-    """Interactive REPL for the agent."""
+    """Interactive REPL for the agent with @ file references and / command completion."""
 
     COMMANDS = {
         # 基础命令
@@ -24,6 +42,7 @@ class REPL:
         # 任务与待办
         "/tasks": "查看任务列表",
         "/todos": "查看待办事项",
+        "/new": "创建新任务 (用法: /new <title>)",
 
         # 记忆与知识
         "/memory": "查看记忆系统",
@@ -38,7 +57,11 @@ class REPL:
         "/spawn": "召唤新队友 (用法: /spawn <name> <role> <task>)",
         "/send": "发送消息给队友 (用法: /send <name> <message>)",
         "/inbox": "查看收件箱",
-        "/pool": "管理 Agent 池 (list/run/stop)",
+        "/pool": "管理 Agent 池 (list/run/clear)",
+
+        # 文件操作
+        "/read": "读取文件 (用法: /read <path>)",
+        "/ls": "列出文件 (用法: /ls [dir])",
 
         # 系统功能
         "/cron": "查看定时任务",
@@ -52,20 +75,248 @@ class REPL:
         self.runner = runner
         self.history: list[str] = []
         self.running = True
+        self.console = Console() if HAS_RICH else None
+        self._file_cache: dict[str, str] = {}
+
+        # 设置 readline 补全
+        if HAS_READLINE:
+            self._setup_readline()
+
+    def _setup_readline(self) -> None:
+        """设置 readline 命令补全."""
+        readline.set_completer(self._completer)
+        readline.parse_and_bind("tab: complete")
+        readline.parse_and_bind("set show-all-if-ambiguous on")
+
+    def _completer(self, text: str, state: int) -> Optional[str]:
+        """自定义命令补全."""
+        if not text:
+            return None
+
+        # 命令补全 (以 / 开头)
+        if text.startswith("/"):
+            matching = [cmd for cmd in self.COMMANDS.keys() if cmd.startswith(text)]
+            if state < len(matching):
+                return matching[state]
+            return None
+
+        # @ 文件补全
+        if text.startswith("@"):
+            base = text[1:]
+            if "/" in base or "\\" in base:
+                dir_part = os.path.dirname(base)
+                pattern = os.path.basename(base) + "*"
+                dir_path = Path(dir_part) if dir_part else Path.cwd()
+            else:
+                pattern = base + "*"
+                dir_path = Path.cwd()
+
+            matches = []
+            try:
+                for p in dir_path.glob(pattern):
+                    if p.is_file():
+                        prefix = "@" + (str(p.relative_to(Path.cwd())) if p.is_relative_to(Path.cwd()) else str(p))
+                        matches.append(prefix)
+                    elif p.is_dir():
+                        prefix = "@" + (str(p.relative_to(Path.cwd())) if p.is_relative_to(Path.cwd()) else str(p)) + "/"
+                        matches.append(prefix)
+            except Exception:
+                pass
+
+            if not matches:
+                try:
+                    for p in Path.cwd().glob(pattern):
+                        if p.is_file():
+                            matches.append("@" + str(p.name))
+                        elif p.is_dir():
+                            matches.append("@" + str(p.name) + "/")
+                except Exception:
+                    pass
+
+            if state < len(matches):
+                return matches[state]
+            return None
+
+        return None
+
+    def _expand_at_references(self, text: str) -> str:
+        """展开 @ 文件引用为文件内容."""
+        pattern = r'@([^\s@]+)'
+
+        def replace_match(match):
+            filepath = match.group(1)
+            return self._get_file_reference(filepath)
+
+        return re.sub(pattern, replace_match, text)
+
+    def _get_file_reference(self, filepath: str) -> str:
+        """获取文件的引用内容."""
+        path = Path(filepath)
+        if not path.is_absolute():
+            path = Path.cwd() / path
+
+        if not path.exists():
+            return f"[文件不存在: {filepath}]"
+
+        if path.is_dir():
+            return f"[目录: {filepath}]"
+
+        try:
+            cache_key = str(path)
+            if cache_key in self._file_cache:
+                return self._file_cache[cache_key]
+
+            content = path.read_text(encoding="utf-8")
+            max_lines = 100
+            lines = content.split("\n")
+            if len(lines) > max_lines:
+                content = "\n".join(lines[:max_lines])
+                content += f"\n... (共 {len(lines)} 行，省略 {len(lines) - max_lines} 行)"
+
+            ref = f"\n[文件: {filepath}]\n```\n{content}\n```\n"
+            self._file_cache[cache_key] = ref
+            return ref
+        except Exception as e:
+            return f"[读取文件失败: {filepath} - {e}]"
+
+    def _preview_file(self, filepath: str) -> str:
+        """预览文件内容."""
+        path = Path(filepath)
+        if not path.exists():
+            return f"文件不存在: {filepath}"
+        if path.is_dir():
+            return f"是目录: {filepath}"
+
+        try:
+            lines = path.read_text(encoding="utf-8").split("\n")
+            total = len(lines)
+            preview = "\n".join(lines[:20])
+            if total > 20:
+                preview += f"\n... (+{total - 20} 行)"
+            return preview
+        except Exception as e:
+            return f"读取失败: {e}"
+
+    def _get_prompt(self) -> str:
+        """获取带样式的提示符."""
+        if self.console:
+            return "[cyan]>>>[/cyan] "
+        return ">>> "
 
     def print_welcome(self) -> None:
         """Print welcome message."""
-        print("=" * 60)
-        print("MiniCode - Claude-style coding agent")
-        print("=" * 60)
-        print("命令: /help 查看所有命令")
-        print("=" * 60)
+        if self.console:
+            self.console.print(Panel.fit(
+                "[bold cyan]MiniCode[/bold cyan] - 终端编码助手\n"
+                "[dim]支持 @文件 引用和 /命令 快捷操作[/dim]",
+                border_style="cyan"
+            ))
+            print()
+            self.console.print("[dim]提示:[/dim] [cyan]@文件名[/cyan] 引用文件  [cyan]/[/cyan] 查看命令  [cyan]/help[/cyan] 帮助")
+            print()
+        else:
+            print("=" * 60)
+            print("MiniCode - Claude-style coding agent")
+            print("=" * 60)
+            print("@文件名 - 引用文件内容")
+            print("/       - 查看所有命令")
+            print("/help    - 获取帮助")
+            print("=" * 60)
 
     def print_help(self) -> None:
         """Print help message."""
-        print("\n可用命令:")
-        for cmd, desc in self.COMMANDS.items():
-            print(f"  {cmd:<15} {desc}")
+        if self.console:
+            table = Table(title="可用命令", show_lines=True)
+            table.add_column("命令", style="cyan", no_wrap=True)
+            table.add_column("描述", style="white")
+
+            for cmd, desc in self.COMMANDS.items():
+                table.add_row(cmd, desc)
+
+            print()
+            self.console.print(table)
+            print()
+        else:
+            print("\n可用命令:")
+            for cmd, desc in self.COMMANDS.items():
+                print(f"  {cmd:<15} {desc}")
+            print()
+
+    def print_command_list(self) -> None:
+        """Print command list when user types /."""
+        if self.console:
+            table = Table(title="命令列表", show_header=True)
+            table.add_column("命令", style="cyan", width=20)
+            table.add_column("描述", style="white")
+
+            for cmd, desc in self.COMMANDS.items():
+                table.add_row(cmd, desc)
+
+            print()
+            self.console.print(table)
+            print()
+        else:
+            print("\n命令列表:")
+            for cmd, desc in self.COMMANDS.items():
+                print(f"  {cmd:<15} {desc}")
+            print()
+
+    def _do_ls(self, path: str = ".") -> None:
+        """列出目录文件."""
+        try:
+            p = Path(path) if Path(path).is_absolute() else Path.cwd() / path
+            if not p.exists():
+                print(f"目录不存在: {path}")
+                return
+
+            items = list(p.iterdir())
+            items.sort(key=lambda x: (not x.is_file(), x.name))
+
+            if self.console:
+                table = Table(title=f"[cyan]{p}[/cyan]")
+                table.add_column("名称", style="white")
+                table.add_column("类型", style="dim")
+                for item in items[:20]:
+                    if item.is_dir():
+                        table.add_row(f"[blue]{item.name}/[/blue]", "目录")
+                    else:
+                        table.add_row(f"[green]{item.name}[/green]", "文件")
+                print()
+                self.console.print(table)
+            else:
+                print(f"\n{p}")
+                for item in items[:20]:
+                    if item.is_dir():
+                        print(f"  [DIR]  {item.name}")
+                    else:
+                        print(f"         {item.name}")
+            if len(items) > 20:
+                print(f"\n... 共 {len(items)} 项")
+            print()
+        except Exception as e:
+            print(f"错误: {e}")
+
+    def _do_new_task(self, title: str) -> None:
+        """创建新任务."""
+        if not title:
+            print("[用法] /new <任务标题>")
+            return
+
+        from minicode.tools.task_tools import TaskManager
+        tm = TaskManager()
+        task = tm.create(title, "")
+        print(f"[新建任务] {title}")
+        print(f"  ID: {task['id']}")
+        print()
+
+    def _do_read(self, filepath: str) -> None:
+        """读取文件预览."""
+        if not filepath:
+            print("[用法] /read <文件路径>")
+            return
+        print(f"\n[文件预览] {filepath}")
+        preview = self._preview_file(filepath)
+        print(preview[:500])
         print()
 
     def print_status(self) -> None:
@@ -469,8 +720,12 @@ class REPL:
         """Handle special command. Returns True if handled."""
         cmd = cmd.strip()
 
+        # / 单独显示命令列表
+        if cmd == "/":
+            self.print_command_list()
+            return True
+
         if cmd in ("/quit", "/exit"):
-            # 退出时触发自我提升总结
             result = self.runner.on_exit()
             if result.get("patterns") or result.get("suggestions"):
                 print("\n[退出总结]")
@@ -487,7 +742,10 @@ class REPL:
             return True
 
         if cmd == "/clear":
-            print("\033[2J\033[H")  # ANSI clear screen
+            if self.console:
+                self.console.clear()
+            else:
+                print("\033[2J\033[H")
             self.print_welcome()
             return True
 
@@ -533,6 +791,11 @@ class REPL:
                     print(f"  [{status}] {subject}")
             return True
 
+        if cmd.startswith("/new"):
+            args = cmd[4:].strip()
+            self._do_new_task(args)
+            return True
+
         if cmd == "/todos":
             self.print_todos()
             return True
@@ -562,7 +825,6 @@ class REPL:
             return True
 
         if cmd.startswith("/mcp"):
-            # 提取参数
             args = cmd[4:].strip()
             self.do_mcp(args)
             return True
@@ -598,6 +860,16 @@ class REPL:
             self.do_compact()
             return True
 
+        if cmd.startswith("/read"):
+            args = cmd[5:].strip()
+            self._do_read(args)
+            return True
+
+        if cmd.startswith("/ls"):
+            args = cmd[3:].strip() or "."
+            self._do_ls(args)
+            return True
+
         if cmd.startswith("/preference "):
             parts = cmd.split(maxsplit=2)
             if len(parts) >= 3:
@@ -624,21 +896,31 @@ class REPL:
 
         while self.running:
             try:
-                user_input = input("\033[36m>>> \033[0m").strip()
+                prompt = self._get_prompt()
+                user_input = input(prompt).strip()
 
                 if not user_input:
                     continue
 
-                # 处理命令
+                # 处理 / 命令
                 if user_input.startswith("/"):
                     await self.handle_command(user_input)
                     continue
 
+                # 检查是否包含 @ 文件引用
+                if "@" in user_input:
+                    files = re.findall(r'@([^\s]+)', user_input)
+                    if files:
+                        print(f"[引用了 {len(files)} 个文件]")
+
                 self.history.append(user_input)
+
+                # 展开 @ 文件引用
+                expanded = self._expand_at_references(user_input)
 
                 # 执行任务
                 print("\n[思考中...]\n")
-                messages = [HumanMessage(content=user_input)]
+                messages = [HumanMessage(content=expanded)]
 
                 try:
                     result = await self.runner.run(messages)
