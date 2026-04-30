@@ -299,9 +299,7 @@ Input:focus {{
     border: solid {theme.FOCUS};
 }}
 
-Input::placeholder {{
-    color: {theme.TEXT_DIM};
-}}
+/* Placeholder styling not supported in Textual CSS */
 
 /* ============================================
    Status Bar
@@ -464,10 +462,7 @@ ScrollableContainer > .scrollbar-grip:hover {{
     color: {theme.WARNING};
 }}
 
-.thinking::after {{
-    content: "...";
-    /* Animation handled via Textual API */
-}}
+/* ::after pseudo-element not supported in Textual CSS */
 
 /* ============================================
    ASCII Art Container
