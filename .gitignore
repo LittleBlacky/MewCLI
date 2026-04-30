@@ -35,7 +35,7 @@ ENV/
 *~
 
 # Project specific
-.mini-agent-cli/
+.minicode/
 demo/
 *.db
 *.sqlite
