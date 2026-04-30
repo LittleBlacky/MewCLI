@@ -34,6 +34,11 @@ class REPL:
 
         # 团队协作
         "/team": "查看团队状态",
+        "/teammates": "列出所有队友",
+        "/spawn": "召唤新队友 (用法: /spawn <name> <role> <task>)",
+        "/send": "发送消息给队友 (用法: /send <name> <message>)",
+        "/inbox": "查看收件箱",
+        "/pool": "管理 Agent 池 (list/run/stop)",
 
         # 系统功能
         "/cron": "查看定时任务",
@@ -127,6 +132,173 @@ class REPL:
             print(f"\n[Cron] {len(jobs)} 个任务")
             for job in jobs:
                 print(f"  • {job['id']}: {job.get('task', 'N/A')}")
+        print()
+
+    def do_team(self) -> None:
+        """Handle team commands."""
+        from minicode.tools.team_tools import get_teammate_manager, get_message_bus
+
+        mgr = get_teammate_manager()
+        bus = get_message_bus()
+
+        teammates = mgr.list_teammates()
+        print("\n[团队]")
+
+        if not teammates:
+            print("  暂无队友")
+            print("\n  使用 /spawn <name> <role> <task> 召唤新队友")
+        else:
+            print(f"  队友数量: {len(teammates)}")
+            for tm in teammates:
+                status = "空闲" if tm.get("status") == "idle" else "工作中"
+                print(f"  - {tm['name']} ({tm['role']}) [{status}]")
+
+        # 显示收件箱未读消息
+        inbox = bus._load_inbox()
+        unread = sum(len(msgs) for msgs in inbox.values())
+        if unread > 0:
+            print(f"\n  未读消息: {unread} 条 (使用 /inbox 查看)")
+
+        print()
+
+    def do_teammates(self) -> None:
+        """List all teammates."""
+        from minicode.tools.team_tools import get_teammate_manager
+
+        mgr = get_teammate_manager()
+        teammates = mgr.list_teammates()
+
+        if not teammates:
+            print("\n[队友] 暂无队友")
+            print("  使用 /spawn <name> <role> <task> 召唤新队友")
+        else:
+            print(f"\n[队友] {len(teammates)} 个")
+            for tm in teammates:
+                print(f"  - {tm['name']}: {tm['role']} (状态: {tm.get('status', 'unknown')})")
+        print()
+
+    def do_spawn(self, args: str = "") -> None:
+        """Spawn a new teammate."""
+        parts = args.split(maxsplit=2)
+
+        if len(parts) < 3:
+            print("\n[召唤] 用法: /spawn <name> <role> <task>")
+            print("  示例: /spawn coder 前端开发 实现用户登录页面")
+            print("  示例: /spawn reviewer 代码审查 审查登录模块代码")
+            print()
+            return
+
+        name, role, task = parts[0], parts[1], parts[2]
+
+        from minicode.tools.team_tools import get_teammate_manager
+        mgr = get_teammate_manager()
+
+        tm = mgr.spawn(name, role, task)
+        print(f"\n[召唤] 成功创建队友 {name}")
+        print(f"  角色: {role}")
+        print(f"  任务: {task}")
+        print(f"  状态: {tm['status']}")
+        print("\n使用 /send <name> <message> 发送消息给队友")
+        print()
+
+    def do_send(self, args: str = "") -> None:
+        """Send message to a teammate."""
+        parts = args.split(maxsplit=1)
+
+        if len(parts) < 2:
+            print("\n[发送] 用法: /send <name> <message>")
+            print("  示例: /send coder 开始实现登录功能")
+            print()
+            return
+
+        name, message = parts[0], parts[1]
+
+        from minicode.tools.team_tools import get_message_bus
+        bus = get_message_bus()
+
+        result = bus.send(name, message)
+        print(f"\n{result}")
+        print()
+
+    def do_inbox(self) -> None:
+        """Read inbox messages."""
+        from minicode.tools.team_tools import get_message_bus
+
+        bus = get_message_bus()
+        messages = bus.read_inbox("main")
+
+        print(f"\n{messages}")
+        print()
+
+    def do_pool(self, args: str = "") -> None:
+        """Manage agent pool."""
+        parts = args.split(maxsplit=1)
+        action = parts[0].lower() if parts else ""
+
+        from minicode.agent.subagent import SubAgentPool
+
+        # 获取或创建全局池
+        global _subagent_pool
+        if '_subagent_pool' not in globals():
+            globals()['_subagent_pool'] = SubAgentPool(max_agents=5)
+
+        pool = globals()['_subagent_pool']
+
+        if action == "" or action == "list":
+            print(f"\n[Agent 池]")
+            print(f"  最大代理数: {pool.max_agents}")
+            print(f"  当前代理数: {len(pool.agents)}")
+            if pool.agents:
+                for agent in pool.agents:
+                    print(f"  - {agent.name}: {agent.role}")
+            print("\n  用法:")
+            print("    /pool list      - 列出代理")
+            print("    /pool run <name> <role> <task>")
+            print("                  - 创建并运行子代理")
+            print("    /pool clear     - 清空代理池")
+            print()
+            return
+
+        if action == "run":
+            if len(parts) < 2:
+                print("\n[池] 用法: /pool run <name> <role> <task>")
+                print("  示例: /pool run coder 前端 实现登录页面")
+                print()
+                return
+
+            sub_parts = parts[1].split(maxsplit=2)
+            if len(sub_parts) < 3:
+                print("\n[池] 参数不足: /pool run <name> <role> <task>")
+                print()
+                return
+
+            name, role, task = sub_parts[0], sub_parts[1], sub_parts[2]
+
+            print(f"\n[池] 创建子代理 {name}...")
+            agent = pool.create(name, role, task)
+
+            # 异步运行
+            async def run_agent():
+                result = await agent.run()
+                print(f"\n[池] {name} 完成:")
+                print(f"  {result[:200]}..." if len(result) > 200 else f"  {result}")
+
+            import asyncio
+            try:
+                asyncio.get_event_loop().run_until_complete(run_agent())
+            except RuntimeError:
+                asyncio.new_event_loop().run_until_complete(run_agent())
+            print()
+            return
+
+        if action == "clear":
+            pool.clear()
+            print("\n[池] 已清空")
+            print()
+            return
+
+        print(f"\n[池] 未知命令: {action}")
+        print("  用法: /pool [list|run|clear]")
         print()
 
     def print_hooks(self) -> None:
@@ -393,6 +565,33 @@ class REPL:
             # 提取参数
             args = cmd[4:].strip()
             self.do_mcp(args)
+            return True
+
+        if cmd == "/team":
+            self.do_team()
+            return True
+
+        if cmd == "/teammates":
+            self.do_teammates()
+            return True
+
+        if cmd.startswith("/spawn"):
+            args = cmd[7:].strip()
+            self.do_spawn(args)
+            return True
+
+        if cmd.startswith("/send"):
+            args = cmd[6:].strip()
+            self.do_send(args)
+            return True
+
+        if cmd == "/inbox":
+            self.do_inbox()
+            return True
+
+        if cmd.startswith("/pool"):
+            args = cmd[5:].strip()
+            self.do_pool(args)
             return True
 
         if cmd == "/compact":
