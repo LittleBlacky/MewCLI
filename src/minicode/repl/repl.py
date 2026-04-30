@@ -40,6 +40,7 @@ class REPL:
         "/hooks": "查看钩子列表",
         "/compact": "压缩对话历史",
         "/stats": "查看统计信息",
+        "/mcp": "管理 MCP 服务器 (list/add/remove)",
     }
 
     def __init__(self, runner):
@@ -150,6 +151,121 @@ class REPL:
         # 保留最近3条消息
         result = compact_history.invoke({"keep_recent": 3})
         print(f"\n[压缩] {result}")
+        print()
+
+    def do_mcp(self, args: str = "") -> None:
+        """Handle MCP commands."""
+        parts = args.split(maxsplit=1)
+        action = parts[0].lower() if parts else ""
+        rest = parts[1] if len(parts) > 1 else ""
+
+        from minicode.tools.mcp_tools import get_mcp_client, mcp_connect, mcp_disconnect
+
+        client = get_mcp_client()
+
+        if action == "" or action == "list":
+            # 列出所有服务器
+            servers = client.list_servers()
+            if not servers:
+                print("\n[MCP] 暂无已配置的服务器")
+                print("  用法: /mcp add <name> <transport> <command> [args]")
+                print("  示例: /mcp add filesystem stdio npx -y @modelcontextprotocol/server-filesystem /path")
+            else:
+                print(f"\n[MCP] 已配置服务器 ({len(servers)}):")
+                for srv in servers:
+                    print(f"  - {srv['name']} ({srv['config'].get('transport', 'unknown')})")
+                tools = client.get_tools()
+                if tools:
+                    print(f"\n[MCP] 可用工具 ({len(tools)}):")
+                    for t in tools[:10]:
+                        print(f"  - {t.name}")
+                    if len(tools) > 10:
+                        print(f"  ... 还有 {len(tools) - 10} 个")
+            print()
+            return
+
+        if action == "add":
+            # 添加服务器
+            # 格式: /mcp add <name> <transport> <command> [args] [env]
+            # 示例: /mcp add filesystem stdio npx -y @modelcontextprotocol/server-filesystem C:/Temp
+            if not rest:
+                print("\n[MCP] 用法: /mcp add <name> <transport> <command> [cmd_args]")
+                print("  示例: /mcp add filesystem stdio npx -y @modelcontextprotocol/server-filesystem C:/Temp")
+                print("  示例: /mcp add github stdio npx -y @modelcontextprotocol/server-github")
+                print()
+                return
+
+            # 解析参数
+            sub_parts = rest.split()
+            if len(sub_parts) < 3:
+                print("\n[MCP] 参数不足，需要: <name> <transport> <command> [cmd_args]")
+                print("  示例: /mcp add filesystem stdio npx -y @modelcontextprotocol/server-filesystem C:/Temp")
+                print()
+                return
+
+            name = sub_parts[0]
+            transport = sub_parts[1]
+            command = sub_parts[2]
+            cmd_args = " ".join(sub_parts[3:]) if len(sub_parts) > 3 else ""
+
+            print(f"\n[MCP] 连接 {name}...")
+            result = mcp_connect.invoke({
+                "server_name": name,
+                "transport": transport,
+                "command": command,
+                "cmd_args": cmd_args,
+                "env": "{}",
+                "url": "",
+            })
+            print(f"  {result}")
+
+            # 刷新并显示工具
+            client.refresh()
+            tools = client.get_tools()
+            if tools:
+                print(f"\n[MCP] 已连接！可用工具 ({len(tools)}):")
+                for t in tools[:10]:
+                    print(f"  - {t.name}")
+                if len(tools) > 10:
+                    print(f"  ... 还有 {len(tools) - 10} 个")
+            print()
+            return
+
+        if action == "remove" or action == "disconnect":
+            if not rest:
+                print("\n[MCP] 用法: /mcp remove <name>")
+                print("  示例: /mcp remove github")
+                print()
+                return
+
+            print(f"\n[MCP] 断开 {rest}...")
+            result = mcp_disconnect.invoke({"server_name": rest})
+            print(f"  {result}")
+            print()
+            return
+
+        if action == "refresh":
+            print("\n[MCP] 刷新工具列表...")
+            count = client.refresh()
+            print(f"  已刷新，{count} 个工具可用")
+            print()
+            return
+
+        if action == "help":
+            print("\n[MCP] 可用命令:")
+            print("  /mcp list        - 列出已配置的服务器")
+            print("  /mcp add <name> <transport> <command> [cmd_args]")
+            print("                  - 添加并连接 MCP 服务器")
+            print("  /mcp remove <name> - 断开并移除服务器")
+            print("  /mcp refresh     - 刷新工具列表")
+            print("\n示例:")
+            print("  /mcp add filesystem stdio npx -y @modelcontextprotocol/server-filesystem C:/Temp")
+            print("  /mcp add github stdio npx -y @modelcontextprotocol/server-github")
+            print()
+            return
+
+        print(f"\n[MCP] 未知命令: {action}")
+        print("  用法: /mcp [list|add|remove|refresh|help]")
         print()
 
     def print_response(self, messages: list) -> None:
@@ -271,6 +387,12 @@ class REPL:
 
         if cmd == "/hooks":
             self.print_hooks()
+            return True
+
+        if cmd.startswith("/mcp"):
+            # 提取参数
+            args = cmd[4:].strip()
+            self.do_mcp(args)
             return True
 
         if cmd == "/compact":
