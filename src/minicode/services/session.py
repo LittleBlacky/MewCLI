@@ -8,7 +8,7 @@ class SessionManager:
     """Manage user sessions."""
 
     def __init__(self, storage_dir: Optional[Path] = None):
-        self.storage_dir = storage_dir or Path.home() / ".mini-agent-cli" / "sessions"
+        self.storage_dir = storage_dir or Path.home() / ".minicode" / "sessions"
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
     def create_session(self, session_id: str) -> dict:

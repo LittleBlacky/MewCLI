@@ -11,7 +11,7 @@ class BackgroundManager:
     """Manage background tasks."""
 
     def __init__(self, storage_dir: Optional[Path] = None):
-        self.storage_dir = storage_dir or Path.cwd() / ".mini-agent-cli"
+        self.storage_dir = storage_dir or Path.cwd() / ".minicode"
         self.pending_file = self.storage_dir / "background_pending.json"
         self.completed_dir = self.storage_dir / "background_completed"
         self.completed_dir.mkdir(parents=True, exist_ok=True)

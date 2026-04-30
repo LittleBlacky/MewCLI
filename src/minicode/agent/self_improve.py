@@ -17,7 +17,7 @@ from dataclasses import dataclass, field
 
 
 WORKDIR = Path.cwd()
-STORAGE_DIR = WORKDIR / ".mini-agent-cli"
+STORAGE_DIR = WORKDIR / ".minicode"
 MEMORY_DIR = STORAGE_DIR / ".memory"
 SKILLS_DIR = STORAGE_DIR / "skills"
 

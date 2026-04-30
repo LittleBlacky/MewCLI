@@ -9,7 +9,7 @@ from typing import Optional, Any
 from langchain_core.tools import tool
 
 WORKDIR = Path.cwd()
-STORAGE_DIR = WORKDIR / ".mini-agent-cli"
+STORAGE_DIR = WORKDIR / ".minicode"
 
 
 class MultiServerMCP:

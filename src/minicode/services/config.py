@@ -9,7 +9,7 @@ class ConfigManager:
     """Manage application configuration."""
 
     def __init__(self, config_path: Optional[Path] = None):
-        self.config_path = config_path or Path.home() / ".mini-agent-cli" / "config.json"
+        self.config_path = config_path or Path.home() / ".minicode" / "config.json"
         self._config = self._load()
 
     def _load(self) -> dict:
@@ -30,7 +30,7 @@ class ConfigManager:
                 "mode": "default",
             },
             "storage": {
-                "dir": str(Path.home() / ".mini-agent-cli"),
+                "dir": str(Path.home() / ".minicode"),
             },
             "features": {
                 "auto_compact": True,

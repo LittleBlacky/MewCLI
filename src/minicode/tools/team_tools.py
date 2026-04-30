@@ -11,7 +11,7 @@ class MessageBus:
     """Simple message bus for inter-agent communication."""
 
     def __init__(self, storage_dir: Optional[Path] = None):
-        self.storage_dir = storage_dir or Path.cwd() / ".mini-agent-cli" / "team"
+        self.storage_dir = storage_dir or Path.cwd() / ".minicode" / "team"
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.inbox_file = self.storage_dir / "inbox.json"
 
@@ -59,7 +59,7 @@ class TeammateManager:
     """Manage teammate agents."""
 
     def __init__(self, storage_dir: Optional[Path] = None):
-        self.storage_dir = storage_dir or Path.cwd() / ".mini-agent-cli" / "team"
+        self.storage_dir = storage_dir or Path.cwd() / ".minicode" / "team"
         self.storage_dir.mkdir(parents=True, exist_ok=True)
         self.config_file = self.storage_dir / "teammates.json"
         self.bus = MessageBus(storage_dir)

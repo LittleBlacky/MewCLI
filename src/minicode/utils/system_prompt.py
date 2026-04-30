@@ -30,7 +30,7 @@ class SystemPromptBuilder:
       2. tool listing
       3. skill metadata
       4. memory section
-      5. MINI_AGENT.md chain
+      5. MINICODE.md chain
       6. dynamic context
     """
 
@@ -42,7 +42,7 @@ class SystemPromptBuilder:
         storage_dir: Optional[Path] = None,
     ):
         self.workdir = workdir or Path.cwd()
-        self.storage_dir = storage_dir or (self.workdir / ".mini-agent-cli")
+        self.storage_dir = storage_dir or (self.workdir / ".minicode")
         self.skills_dir = skills_dir or (self.storage_dir / "skills")
         self.memory_dir = memory_dir or (self.storage_dir / ".memory")
 
@@ -135,11 +135,11 @@ class SystemPromptBuilder:
         return "\n".join(lines)
 
     def _build_agent_md(self) -> str:
-        """Build MINI_AGENT.md instructions."""
+        """Build MINICODE.md instructions."""
         sources = []
 
         # User global
-        user_agent = Path.home() / ".mini-agent-cli" / "MINI_AGENT.md"
+        user_agent = Path.home() / ".minicode" / "MINICODE.md"
         if user_agent.exists():
             try:
                 sources.append(("user global", user_agent.read_text(encoding="utf-8")))
@@ -147,7 +147,7 @@ class SystemPromptBuilder:
                 pass
 
         # Project root
-        project_agent = self.workdir / "MINI_AGENT.md"
+        project_agent = self.workdir / "MINICODE.md"
         if project_agent.exists():
             try:
                 sources.append(("project root", project_agent.read_text(encoding="utf-8")))
@@ -157,7 +157,7 @@ class SystemPromptBuilder:
         # Current subdir
         cwd = Path.cwd()
         if cwd != self.workdir:
-            subdir_agent = cwd / "MINI_AGENT.md"
+            subdir_agent = cwd / "MINICODE.md"
             if subdir_agent.exists():
                 try:
                     sources.append(("subdir", subdir_agent.read_text(encoding="utf-8")))
@@ -167,7 +167,7 @@ class SystemPromptBuilder:
         if not sources:
             return ""
 
-        parts = ["# MINI_AGENT.md instructions"]
+        parts = ["# MINICODE.md instructions"]
         for label, content in sources:
             parts.append(f"## From {label}")
             parts.append(content.strip())
@@ -220,7 +220,7 @@ class SystemPromptBuilder:
             if memory_section:
                 sections.append(memory_section)
 
-        # 5. MINI_AGENT.md
+        # 5. MINICODE.md
         agent_md = self._build_agent_md()
         if agent_md:
             sections.append(agent_md)

@@ -14,7 +14,7 @@ class CronScheduler:
     """Simple cron-like scheduler for tasks."""
 
     def __init__(self, storage_dir: Optional[Path] = None):
-        self.storage_dir = storage_dir or Path.cwd() / ".mini-agent-cli"
+        self.storage_dir = storage_dir or Path.cwd() / ".minicode"
         self.schedules_file = self.storage_dir / "cron_schedules.json"
         self.notifications_file = self.storage_dir / "cron_notifications.json"
 

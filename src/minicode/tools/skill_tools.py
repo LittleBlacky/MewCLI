@@ -11,7 +11,7 @@ class SkillManager:
     """Manage agent skills."""
 
     def __init__(self, skills_dir: Optional[Path] = None):
-        self.skills_dir = skills_dir or Path.cwd() / ".mini-agent-cli" / "skills"
+        self.skills_dir = skills_dir or Path.cwd() / ".minicode" / "skills"
         self.skills_dir.mkdir(parents=True, exist_ok=True)
 
     def list(self) -> list[dict]:

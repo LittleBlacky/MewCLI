@@ -11,7 +11,7 @@ class TaskManager:
     """Persistent task management."""
 
     def __init__(self, storage_dir: Optional[Path] = None):
-        self.storage_dir = storage_dir or Path.cwd() / ".mini-agent-cli" / "tasks"
+        self.storage_dir = storage_dir or Path.cwd() / ".minicode" / "tasks"
         self.storage_dir.mkdir(parents=True, exist_ok=True)
 
     def _task_file(self, task_id: str) -> Path:

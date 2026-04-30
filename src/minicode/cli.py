@@ -11,15 +11,14 @@ from minicode.agent.session import SessionConfig
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="MiniCode - Claude-style coding agent",
+        description="MiniCode - 智能终端编码助手",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  minicode                          Start interactive REPL
-  minicode "fix the bug"            Run a single task
-  minicode --model claude-3-opus   Use different model
+  minicode                          Start with TUI interface
+  minicode "fix the bug"            Run a single task with TUI
+  minicode --model claude-sonnet-4-7   Use different model
   minicode --workdir /path/to/proj  Set working directory
-  minicode --tui                   Start with Textual TUI (with ASCII cat!)
 
 Tips:
   @filename  - Reference a file in your message
@@ -28,13 +27,12 @@ Tips:
         """,
     )
     parser.add_argument("task", nargs="?", help="Task to execute")
-    parser.add_argument("--model", "-m", default="claude-sonnet-4-7", help="Model name (default: claaude-sonnet-4-7)")
+    parser.add_argument("--model", "-m", default="claude-sonnet-4-7", help="Model name (default: claude-sonnet-4-7)")
     parser.add_argument("--provider", "-p", default="anthropic", help="Model provider (default: anthropic)")
     parser.add_argument("--workdir", "-w", type=Path, help="Working directory")
     parser.add_argument("--session", "-s", default="default", help="Session ID")
     parser.add_argument("--no-checkpoint", action="store_true", help="Disable checkpoint")
     parser.add_argument("--db", help="SQLite DB path for checkpointing")
-    parser.add_argument("--tui", "-t", action="store_true", help="Start with Textual TUI (with ASCII cat)")
     return parser.parse_args()
 
 
@@ -58,46 +56,23 @@ async def run_task(runner: AgentRunner, task: str) -> None:
 def main():
     args = parse_args()
 
-    # TUI mode
-    if args.tui:
-        print("Starting MiniCode TUI Mode...")
-        from minicode.tui.app import run_tui
-        runner = AgentRunner(
-            model_provider=args.provider,
-            model_name=args.model,
-            use_checkpoint=not args.no_checkpoint,
-            workdir=args.workdir,
-            thread_id=args.session,
-        )
-        asyncio.run(run_tui(runner))
-        return
-
-    # Interactive mode (no task provided)
-    if not args.task:
-        print("Starting MiniCode Interactive Mode...")
-        print(f"Model: {args.model}")
-        print("@filename - Reference files")
-        print("/          - Show commands")
-        print("-" * 50)
-
-        asyncio.run(run_interactive(
-            model_provider=args.provider,
-            model_name=args.model,
-            thread_id=args.session,
-        ))
-        return
-
-    # Single task mode
+    # Always start with TUI mode
+    print("Starting MiniCode TUI...")
+    from minicode.tui.app import run_tui
     runner = AgentRunner(
         model_provider=args.provider,
         model_name=args.model,
         use_checkpoint=not args.no_checkpoint,
-        db_path=args.db,
         workdir=args.workdir,
         thread_id=args.session,
     )
 
-    asyncio.run(run_task(runner, args.task))
+    # If a task is provided, execute it then show TUI
+    if args.task:
+        asyncio.run(run_task(runner, args.task))
+
+    # Always show TUI
+    asyncio.run(run_tui(runner))
 
 
 if __name__ == "__main__":

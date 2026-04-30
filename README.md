@@ -1,6 +1,6 @@
 # MiniCode
 
-A terminal coding agent powered by LangGraph.
+A terminal coding assistant powered by AI.
 
 ## Features
 
@@ -52,7 +52,7 @@ Launches REPL mode with interactive input.
 
 ## Configuration
 
-Create `~/.mini-agent-cli/config.json`:
+Create `~/.minicode/config.json`:
 
 ```json
 {

@@ -11,7 +11,7 @@ from langchain_core.tools import tool
 HOOK_EVENTS = ("PreToolUse", "PostToolUse", "SessionStart")
 HOOK_TIMEOUT = 30
 
-STORAGE_DIR = Path.cwd() / ".mini-agent-cli"
+STORAGE_DIR = Path.cwd() / ".minicode"
 HOOK_CONFIG_PATH = STORAGE_DIR / ".hooks.json"
 TRUST_MARKER = STORAGE_DIR / ".trusted"
 
@@ -251,7 +251,7 @@ def hook_list() -> str:
 def hook_reload() -> str:
     """Reload hooks from configuration file.
 
-    Use this after editing .mini-agent-cli/.hooks.json
+    Use this after editing .minicode/.hooks.json
     """
     manager = get_hook_manager()
     manager.reload()

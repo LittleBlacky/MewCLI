@@ -68,7 +68,7 @@ class AutonomousAgent:
         """Scan for unclaimed tasks."""
         from pathlib import Path
 
-        storage_dir = Path.cwd() / ".mini-agent-cli" / "tasks"
+        storage_dir = Path.cwd() / ".minicode" / "tasks"
         if not storage_dir.exists():
             return None
 

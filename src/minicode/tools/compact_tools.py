@@ -8,7 +8,7 @@ from typing import Optional
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 
 WORKDIR = Path.cwd()
-STORAGE_DIR = WORKDIR / ".mini-agent-cli"
+STORAGE_DIR = WORKDIR / ".minicode"
 TOOL_RESULTS_DIR = STORAGE_DIR / "task_outputs" / "tool-results"
 
 # Limits

@@ -14,7 +14,7 @@ from minicode.tools.compact_tools import compact_messages
 
 
 WORKDIR = Path.cwd()
-STORAGE_DIR = WORKDIR / ".mini-agent-cli"
+STORAGE_DIR = WORKDIR / ".minicode"
 OUTPUT_DIR = STORAGE_DIR / "outputs"
 
 # 上下文限制配置
