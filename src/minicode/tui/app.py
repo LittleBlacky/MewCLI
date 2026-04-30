@@ -253,9 +253,12 @@ class MiniCodeTUI(App):
         self.history_index = len(self.history)
 
         # Add to sidebar history
-        sidebar = self.query_one("#sidebar", Static)
-        if sidebar and hasattr(sidebar, "add_history"):
-            sidebar.add_history(command)
+        try:
+            sidebar = self.query_one("#sidebar")
+            if hasattr(sidebar, "add_history"):
+                sidebar.add_history(command)
+        except Exception:
+            pass
 
         # Add user message
         self.messages.append(HumanMessage(content=command))
