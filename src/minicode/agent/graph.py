@@ -39,6 +39,66 @@ WORKDIR = Path.cwd()
 TOOL_MAP: dict[str, BaseTool] = {t.name: t for t in ALL_TOOLS}
 TOOL_NODE = ToolNode(ALL_TOOLS, handle_tool_errors=True)
 
+# ============ MCP 动态工具支持 ============
+_MCP_DYNAMIC_TOOLS: list[BaseTool] = []
+_MCP_TOOL_NODE: Optional[ToolNode] = None
+
+
+def refresh_mcp_tools() -> int:
+    """刷新 MCP 动态工具（从 langchain-mcp-adapters）
+
+    调用此函数会重新从已连接的 MCP 服务器获取工具，
+    并更新 TOOL_MAP 和重新创建 TOOL_NODE。
+
+    Returns:
+        获取到的工具数量
+    """
+    global _MCP_DYNAMIC_TOOLS, _MCP_TOOL_NODE, TOOL_MAP, TOOL_NODE
+
+    try:
+        from minicode.tools.mcp_tools import get_mcp_client
+        client = get_mcp_client()
+
+        # 获取 MCP 工具
+        new_tools = client.get_tools()
+
+        if new_tools:
+            _MCP_DYNAMIC_TOOLS = new_tools
+
+            # 更新全局工具映射
+            TOOL_MAP = {t.name: t for t in ALL_TOOLS}
+            for t in _MCP_DYNAMIC_TOOLS:
+                TOOL_MAP[t.name] = t
+
+            # 重新创建工具节点（包含 MCP 工具）
+            TOOL_NODE = ToolNode(ALL_TOOLS + _MCP_DYNAMIC_TOOLS, handle_tool_errors=True)
+
+            # 重置模型以包含新工具
+            reset_for_mcp_refresh()
+
+            return len(new_tools)
+    except Exception as e:
+        print(f"[MCP] Failed to refresh tools: {e}")
+
+    return 0
+
+
+def get_all_tools() -> list[BaseTool]:
+    """获取所有可用工具（包括 MCP 动态工具）"""
+    return ALL_TOOLS + _MCP_DYNAMIC_TOOLS
+
+
+def get_tool_map() -> dict[str, BaseTool]:
+    """获取工具映射"""
+    return TOOL_MAP
+
+
+def reset_for_mcp_refresh():
+    """在刷新 MCP 工具后重置 AgentGraphBuilder"""
+    builder = AgentGraphBuilder.get_instance()
+    if builder:
+        builder.reset()
+
 
 class BashSecurityValidator:
     """简单的 Bash 命令安全验证"""
@@ -91,11 +151,13 @@ class AgentGraphBuilder:
     @property
     def model_with_tools(self):
         if self._model_with_tools is None:
-            self._model_with_tools = self.model.bind_tools(ALL_TOOLS)
+            # 绑定所有工具（包括 MCP 动态工具）
+            all_tools = get_all_tools()
+            self._model_with_tools = self.model.bind_tools(all_tools)
         return self._model_with_tools
 
     def reset(self):
-        """重置模型实例（用于切换模型时）"""
+        """重置模型实例（用于切换模型或刷新工具时）"""
         self._model = None
         self._model_with_tools = None
 

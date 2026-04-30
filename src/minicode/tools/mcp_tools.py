@@ -1,246 +1,210 @@
-"""MCP (Model Context Protocol) client tools - Full implementation."""
+"""MCP (Model Context Protocol) client tools - 使用 langchain-mcp-adapters."""
 from __future__ import annotations
 
+import asyncio
+import concurrent.futures
 import json
-import subprocess
-import threading
 from pathlib import Path
 from typing import Optional, Any
-from dataclasses import dataclass
 
+from langchain_core.tools import tool
 
 WORKDIR = Path.cwd()
 STORAGE_DIR = WORKDIR / ".mini-agent-cli"
 
-
-@dataclass
-class MCPTool:
-    """Represents a tool from MCP server."""
-    name: str
-    description: str
-    input_schema: dict
+# 线程池用于异步执行
+_executor = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
 
-class MCPConnection:
-    """Manages a connection to an MCP server via stdio."""
-
-    def __init__(self, name: str, command: list[str]):
-        self.name = name
-        self.command = command
-        self.process: Optional[subprocess.Popen] = None
-        self._lock = threading.Lock()
-        self._request_id = 0
-        self._callbacks: dict[str, callable] = {}
-
-    def connect(self) -> bool:
-        """Start the MCP server process."""
-        try:
-            self.process = subprocess.Popen(
-                self.command,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                cwd=WORKDIR,
-            )
-            # Send initialize request
-            result = self._send_request("initialize", {
-                "protocolVersion": "2024-11-05",
-                "capabilities": {"roots": {"listChanged": True}},
-                "clientInfo": {"name": "minicode", "version": "0.1.0"},
-            })
-            return result is not None
-        except Exception as e:
-            print(f"[MCP] Failed to connect to {self.name}: {e}")
-            return False
-
-    def _send_request(self, method: str, params: dict = None) -> Optional[dict]:
-        """Send a JSON-RPC request and wait for response."""
-        if not self.process or self.process.poll() is not None:
-            return None
-
-        self._request_id += 1
-        request = {
-            "jsonrpc": "2.0",
-            "id": self._request_id,
-            "method": method,
-            "params": params or {},
-        }
-
-        with self._lock:
-            try:
-                self.process.stdin.write(json.dumps(request) + "\n")
-                self.process.stdin.flush()
-
-                # Read response
-                line = self.process.stdout.readline()
-                if line:
-                    return json.loads(line)
-            except Exception as e:
-                print(f"[MCP] Request failed: {e}")
-        return None
-
-    def list_tools(self) -> list[MCPTool]:
-        """List available tools from the server."""
-        result = self._send_request("tools/list")
-        if result and "result" in result:
-            tools = []
-            for t in result["result"].get("tools", []):
-                tools.append(MCPTool(
-                    name=t.get("name", ""),
-                    description=t.get("description", ""),
-                    input_schema=t.get("inputSchema", {}),
-                ))
-            return tools
-        return []
-
-    def call_tool(self, tool_name: str, arguments: dict) -> str:
-        """Call a tool on the MCP server."""
-        result = self._send_request("tools/call", {
-            "name": tool_name,
-            "arguments": arguments,
-        })
-        if result and "result" in result:
-            content = result["result"].get("content", [])
-            if content:
-                return content[0].get("text", "")
-            return "Tool executed successfully"
-        return "[Error] Tool call failed"
-
-    def disconnect(self):
-        """Stop the MCP server process."""
-        if self.process:
-            self.process.terminate()
-            self.process.wait(timeout=5)
-            self.process = None
+def _run_async(coro):
+    """在独立线程中运行协程，避免事件循环冲突"""
+    future = _executor.submit(asyncio.run, coro)
+    return future.result(timeout=60)
 
 
-class MCPClient:
-    """Client for managing multiple MCP server connections."""
+class MultiServerMCP:
+    """基于 langchain-mcp-adapters 的 MCP 客户端."""
 
     def __init__(self, config_path: Optional[Path] = None):
         self.config_path = config_path or STORAGE_DIR / "mcp_servers.json"
-        self.servers: dict[str, MCPConnection] = {}
-        self.available_tools: dict[str, list[MCPTool]] = {}
+        self._client = None
+        self._servers: dict[str, dict] = {}
+        self._tools: list[Any] = []
         self._load_config()
 
     def _load_config(self) -> None:
-        """Load server configuration from file."""
+        """从文件加载服务器配置."""
         if self.config_path.exists():
             try:
                 config = json.loads(self.config_path.read_text(encoding="utf-8"))
-                servers_config = config.get("servers", {})
-                for name, cfg in servers_config.items():
-                    command = cfg.get("command")
-                    if command:
-                        self.servers[name] = MCPConnection(name, command)
+                self._servers = config.get("servers", {})
             except Exception as e:
                 print(f"[MCP] Failed to load config: {e}")
 
     def _save_config(self) -> None:
-        """Save server configuration to file."""
-        config = {
-            "servers": {
-                name: {"command": conn.command}
-                for name, conn in self.servers.items()
-            }
-        }
+        """保存服务器配置到文件."""
+        config = {"servers": self._servers}
         STORAGE_DIR.mkdir(parents=True, exist_ok=True)
         self.config_path.write_text(json.dumps(config, indent=2), encoding="utf-8")
 
-    def add_server(self, name: str, command: list[str]) -> str:
-        """Add and connect a new MCP server."""
-        if name in self.servers:
-            return f"[Error] Server {name} already exists"
+    async def _ensure_client(self):
+        """确保客户端已初始化."""
+        if self._client is None:
+            from langchain_mcp_adapters.client import MultiServerMCPClient
+            from langchain_mcp_adapters.sessions import StdioConnection, SSEConnection, WebsocketConnection, StreamableHttpConnection
 
-        conn = MCPConnection(name, command)
-        if not conn.connect():
-            return f"[Error] Failed to connect to {name}"
+            # 构建连接对象
+            connections = {}
+            for name, config in self._servers.items():
+                transport = config.get("transport")
+                if transport == "stdio":
+                    connections[name] = StdioConnection(
+                        command=config.get("command", ""),
+                        args=config.get("args", []),
+                        env=config.get("env", {}),
+                        transport="stdio",
+                    )
+                elif transport == "sse":
+                    connections[name] = SSEConnection(url=config.get("url", ""), transport="sse")
+                elif transport == "websocket":
+                    connections[name] = WebsocketConnection(url=config.get("url", ""), transport="websocket")
+                elif transport == "http":
+                    connections[name] = StreamableHttpConnection(url=config.get("url", ""), transport="http")
 
-        self.servers[name] = conn
-        self.available_tools[name] = conn.list_tools()
+            self._client = MultiServerMCPClient(connections=connections or None)
+            self._tools = await self._client.get_tools()
+
+    def _connect_sync(self, name: str, config: dict) -> str:
+        """同步连接方法，在线程池中执行"""
+        return _run_async(self._connect_async(name, config))
+
+    async def _connect_async(self, name: str, config: dict) -> str:
+        """异步连接方法"""
+        if name in self._servers:
+            return f"[Error] Server '{name}' already exists"
+
+        transport = config.get("transport")
+        if transport not in ("stdio", "sse", "websocket", "http"):
+            return f"[Error] Unknown transport: {transport}"
+
+        self._servers[name] = config
         self._save_config()
-        return f"[MCP] Connected to {name} with {len(self.available_tools[name])} tools"
 
-    def remove_server(self, name: str) -> str:
-        """Disconnect and remove an MCP server."""
-        if name not in self.servers:
-            return f"[Error] Server {name} not found"
+        try:
+            await self._ensure_client()
+            return f"[MCP] Connected to {name}, {len(self._tools)} tools available"
+        except Exception as e:
+            if name in self._servers:
+                del self._servers[name]
+                self._save_config()
+            return f"[Error] Failed to connect: {e}"
 
-        self.servers[name].disconnect()
-        del self.servers[name]
-        if name in self.available_tools:
-            del self.available_tools[name]
+    def connect(self, name: str, config: dict) -> str:
+        """连接 MCP 服务器（同步接口）"""
+        return self._connect_sync(name, config)
+
+    def disconnect(self, name: str) -> str:
+        """断开 MCP 服务器."""
+        if name not in self._servers:
+            return f"[Error] Server '{name}' not found"
+
+        del self._servers[name]
         self._save_config()
+
+        # 重置客户端
+        self._client = None
+        self._tools = []
+
         return f"[MCP] Disconnected from {name}"
 
     def list_servers(self) -> list[dict]:
-        """List all configured servers."""
-        result = []
-        for name, conn in self.servers.items():
-            tools = self.available_tools.get(name, [])
-            result.append({
-                "name": name,
-                "connected": conn.process is not None,
-                "tool_count": len(tools),
-            })
-        return result
+        """列出所有已配置的服务器."""
+        return [
+            {"name": name, "config": cfg}
+            for name, cfg in self._servers.items()
+        ]
 
-    def list_all_tools(self) -> list[dict]:
-        """List all available tools from all servers."""
-        result = []
-        for name, tools in self.available_tools.items():
-            for t in tools:
-                result.append({
-                    "server": name,
-                    "name": t.name,
-                    "description": t.description,
-                })
-        return result
+    def get_tools(self) -> list[Any]:
+        """获取所有可用的 LangChain 工具."""
+        return self._tools
 
-    def call_tool(self, server: str, tool: str, args: dict) -> str:
-        """Call a tool on a specific server."""
-        if server not in self.servers:
-            return f"[Error] Server {server} not found"
-        return self.servers[server].call_tool(tool, args)
+    def refresh(self) -> int:
+        """刷新工具列表（同步接口）"""
+        return _run_async(self._refresh_async())
 
-    def disconnect_all(self):
-        """Disconnect all servers."""
-        for conn in self.servers.values():
-            conn.disconnect()
+    async def _refresh_async(self) -> int:
+        """刷新工具列表（异步实现）"""
+        await self._ensure_client()
+        return len(self._tools)
 
 
-# Global client instance
-_mcp_client: Optional[MCPClient] = None
+# 全局 MCP 客户端实例
+_mcp_client: Optional["MultiServerMCP"] = None
 
 
-def get_mcp_client(config_path: Optional[Path] = None) -> MCPClient:
+def get_mcp_client() -> MultiServerMCP:
+    """获取全局 MCP 客户端实例."""
     global _mcp_client
     if _mcp_client is None:
-        _mcp_client = MCPClient(config_path)
+        _mcp_client = MultiServerMCP()
     return _mcp_client
 
 
-# LangChain tools
-from langchain_core.tools import tool
-
+# ============ LangChain Tools ============
 
 @tool
-def mcp_connect(server_name: str, command: str) -> str:
+def mcp_connect(
+    server_name: str,
+    transport: str,
+    command: str = "",
+    cmd_args: str = "",
+    env: str = "",
+    url: str = "",
+) -> str:
     """Connect to an MCP server.
 
     Args:
-        server_name: Unique name for this server
-        command: Command to start the MCP server (e.g., ["npx", "-y", "@modelcontextprotocol/server-filesystem", "/path"])
+        server_name: Unique name for this server (e.g., "filesystem", "git")
+        transport: Transport type - "stdio", "sse", "websocket", or "http"
+        command: For stdio transport - the command to run (e.g., "npx")
+        cmd_args: For stdio transport - command arguments as space-separated string
+        env: For stdio transport - environment variables as JSON string
+        url: For sse/websocket/http transport - the server URL
     """
-    import shlex
     client = get_mcp_client()
-    try:
-        cmd_list = shlex.split(command) if isinstance(command, str) else command
-    except Exception:
-        return "[Error] Invalid command format"
 
-    return client.add_server(server_name, cmd_list)
+    cfg = {"transport": transport}
+    if transport == "stdio":
+        cfg["command"] = command
+        # cmd_args can be passed as string or list
+        args = cmd_args
+        if isinstance(args, str):
+            args = args.split() if args else []
+        cfg["args"] = args
+        # env can be passed as dict or JSON string
+        if isinstance(env, str):
+            try:
+                env = json.loads(env) if env else {}
+            except Exception:
+                env = {}
+        cfg["env"] = env or {}
+    elif transport in ("sse", "websocket", "http"):
+        cfg["url"] = url
+    else:
+        return f"[Error] Unknown transport: {transport}"
+
+    # 使用同步接口，自动处理事件循环
+    result = client.connect(server_name, cfg)
+
+    # 自动刷新全局工具映射
+    if "Connected" in result:
+        try:
+            from minicode.agent.graph import refresh_mcp_tools
+            refresh_mcp_tools()
+        except Exception:
+            pass  # 不影响连接结果
+
+    return result
 
 
 @tool
@@ -251,48 +215,98 @@ def mcp_disconnect(server_name: str) -> str:
         server_name: Name of the server to disconnect
     """
     client = get_mcp_client()
-    return client.remove_server(server_name)
+    result = client.disconnect(server_name)
+
+    # 刷新全局工具映射
+    try:
+        from minicode.agent.graph import refresh_mcp_tools
+        refresh_mcp_tools()
+    except Exception:
+        pass
+
+    return result
 
 
 @tool
 def mcp_list() -> str:
-    """List all connected MCP servers and their tools."""
+    """List all configured MCP servers and available tools."""
     client = get_mcp_client()
     servers = client.list_servers()
 
     if not servers:
-        return "No MCP servers configured. Use mcp_connect to add one."
+        return """# MCP Servers
+
+No servers configured. Use `mcp_connect` to add one:
+
+**stdio example:**
+```python
+mcp_connect(
+    server_name="filesystem",
+    transport="stdio",
+    command="npx",
+    cmd_args="-y @modelcontextprotocol/server-filesystem /path"
+)
+```
+
+**HTTP/SSE example:**
+```python
+mcp_connect(
+    server_name="remote",
+    transport="sse",
+    url="https://mcp-server.example.com/sse"
+)
+```
+"""
 
     lines = ["# MCP Servers", ""]
     for srv in servers:
-        status = "✓" if srv["connected"] else "✗"
-        lines.append(f"- {status} {srv['name']}: {srv['tool_count']} tools")
+        lines.append(f"- **{srv['name']}** ({srv['config']['transport']})")
 
-    all_tools = client.list_all_tools()
-    if all_tools:
-        lines.append("\n# Available Tools")
-        for t in all_tools[:20]:
-            lines.append(f"  - [{t['server']}] {t['name']}: {t['description'][:50]}")
+    # 获取工具
+    tools = client.get_tools()
+    if tools:
+        lines.append(f"\n# Available Tools ({len(tools)})")
+        for t in tools:
+            lines.append(f"- `{t.name}`: {t.description[:60]}...")
 
     return "\n".join(lines)
 
 
 @tool
-def mcp_call(server: str, tool: str, args: str = "{}") -> str:
-    """Call a tool on an MCP server.
-
-    Args:
-        server: Server name
-        tool: Tool name on that server
-        args: JSON string of arguments
-    """
+def mcp_get_tools() -> str:
+    """Get all MCP tools as a formatted list for agent use."""
     client = get_mcp_client()
+    tools = client.get_tools()
+
+    if not tools:
+        return "No MCP tools available. Connect to a server first."
+
+    lines = [f"# MCP Tools ({len(tools)})", ""]
+    for t in tools:
+        lines.append(f"## {t.name}")
+        lines.append(f"{t.description}")
+        lines.append("")
+
+    return "\n".join(lines)
+
+
+@tool
+def mcp_refresh() -> str:
+    """Refresh MCP tools from all connected servers."""
+    client = get_mcp_client()
+
+    # 使用同步接口
+    count = client.refresh()
+
+    # 更新全局工具映射
     try:
-        args_dict = json.loads(args)
-    except json.JSONDecodeError:
-        return "[Error] Invalid JSON for args"
+        from minicode.agent.graph import refresh_mcp_tools
+        refresh_mcp_tools()
+    except Exception as e:
+        return f"[MCP] Refreshed client, {count} tools available. Warning: {e}"
 
-    return client.call_tool(server, tool, args_dict)
+    return f"[MCP] Refreshed, {count} tools available and registered"
 
 
-MCP_TOOLS = [mcp_connect, mcp_disconnect, mcp_list, mcp_call]
+# 导出工具列表
+MCP_TOOLS = [mcp_connect, mcp_disconnect, mcp_list, mcp_get_tools, mcp_refresh]
