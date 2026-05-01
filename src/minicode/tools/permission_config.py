@@ -11,7 +11,7 @@ import yaml
 BUILTIN_DANGEROUS_PATTERNS = [
     ("rm_rf_root", r"\brm\s+(-[rf]+)?\s*/\s*$", "critical", "Recursive delete of root"),
     ("sudo_shutdown", r"\bsudo\s+(shutdown|reboot|init\s+[06])", "high", "System shutdown/reboot"),
-    ("fork_bomb", r":\(\)\s*:\s*\|\s*:\s*&\s*;", "critical", "Fork bomb"),
+    ("fork_bomb", r":\(\)\s*\{[^}]+\}\s*;", "critical", "Fork bomb"),
     ("dd_zero", r"\bdd\s+.*of=/dev/", "critical", "Direct disk write"),
     ("mkfs", r"\bmkfs\b", "critical", "Filesystem format"),
     ("curl_pipe_sh", r"curl.*\|\s*(sh|bash|fish|zsh)", "medium", "Pipe to shell"),
