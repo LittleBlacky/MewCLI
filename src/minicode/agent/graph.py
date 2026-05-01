@@ -2,29 +2,26 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 from pathlib import Path
 from typing import Annotated, Any, Literal, Optional
 
 from langchain_core.messages import (
     AIMessage,
-    AIMessageChunk,
     HumanMessage,
     SystemMessage,
     ToolMessage,
 )
-from langchain_core.tools import tool, BaseTool
+from langchain_core.tools import BaseTool
 from langgraph.graph import StateGraph, END
-from langgraph.graph.message import add_messages
 from langgraph.prebuilt import ToolNode
 from langgraph.checkpoint.memory import MemorySaver
 
-from minicode.agent.state import AgentState, MessageState, create_initial_state
+from minicode.agent.state import AgentState, create_initial_state
 from minicode.tools.registry import ALL_TOOLS
 from minicode.services.model_provider import create_provider
 from minicode.utils.system_prompt import get_system_prompt
-from minicode.tools.permission_tools import bash_validator, check_permission
+from minicode.tools.permission_tools import check_permission
 
 try:
     from minicode.agent.memory import get_memory_layer
@@ -38,13 +35,10 @@ WORKDIR = Path.cwd()
 TOOL_MAP: dict[str, BaseTool] = {t.name: t for t in ALL_TOOLS}
 TOOL_NODE = ToolNode(ALL_TOOLS, handle_tool_errors=True)
 
-_MCP_DYNAMIC_TOOLS: list[BaseTool] = []
-_MCP_TOOL_NODE: Optional[ToolNode] = None
-
 
 def refresh_mcp_tools() -> int:
     """Refresh dynamic MCP tools."""
-    global _MCP_TOOL_NODE, TOOL_MAP, TOOL_NODE
+    global TOOL_MAP, TOOL_NODE
 
     try:
         from minicode.tools.mcp_tools import get_mcp_client
@@ -52,7 +46,6 @@ def refresh_mcp_tools() -> int:
 
         client = get_mcp_client()
 
-        import asyncio
         try:
             loop = asyncio.get_running_loop()
             asyncio.create_task(client.refresh())
@@ -213,41 +206,8 @@ def call_model(state: AgentState) -> dict:
     return {"messages": [response]}
 
 
-def _run_tool_async(tool, args: dict) -> Any:
-    """Run async tool in thread pool."""
-    async def _ainvoke():
-        return await tool.ainvoke(args)
-
-    loop = asyncio.new_event_loop()
-    try:
-        return loop.run_until_complete(_ainvoke())
-    finally:
-        loop.close()
-
-
-def _is_async_tool(tool: Any) -> bool:
-    """Check if tool is async."""
-    return hasattr(tool, 'coroutine') and tool.coroutine is not None
-
-
-def _execute_tool(tool: Any, tool_args: dict) -> Any:
-    """Execute single tool."""
-    try:
-        if _is_async_tool(tool):
-            return _run_tool_async(tool, tool_args)
-        else:
-            if hasattr(tool, 'invoke'):
-                return tool.invoke(tool_args)
-            elif hasattr(tool, 'func'):
-                return tool.func(**tool_args)
-            else:
-                return f"[Error] Tool has no invoke or func method"
-    except Exception as e:
-        return f"[Error] {e}"
-
-
 def execute_tools(state: AgentState) -> dict:
-    """Tool execution node."""
+    """Tool execution node using LangGraph ToolNode."""
     messages = state.get("messages", [])
     if not messages:
         return {"messages": [], "tool_messages": []}
@@ -257,44 +217,41 @@ def execute_tools(state: AgentState) -> dict:
         return {"messages": [], "tool_messages": []}
 
     tool_calls = last_message.tool_calls
-    tool_messages = []
+
+    # Separate permission-denied calls from normal calls
+    permission_denied = []
+    allowed_calls = []
 
     for tc in tool_calls:
-        tool_name = tc["name"]
-        tool_args = tc.get("args", {}) or {}
-        tool_call_id = tc.get("id", "")
-
-        if tool_name == "bash_tool":
-            command = tool_args.get("command", "")
+        if tc["name"] == "bash_tool":
+            command = tc.get("args", {}).get("command", "")
             allowed, reason = check_permission(command, "bash_tool")
             if not allowed:
-                tool_messages.append(
-                    ToolMessage(content=f"[Permission Denied]: {reason}", tool_call_id=tool_call_id)
-                )
-                continue
-
-        tool = TOOL_MAP.get(tool_name)
-        if not tool:
-            tool_messages.append(
-                ToolMessage(content=f"[Error] Unknown tool: {tool_name}", tool_call_id=tool_call_id)
-            )
-            continue
-
-        try:
-            result = _execute_tool(tool, tool_args)
-
-            if isinstance(result, ToolMessage):
-                result.tool_call_id = tool_call_id
-                tool_messages.append(result)
+                permission_denied.append((tc, reason))
             else:
-                content = str(result) if not isinstance(result, str) else result
-                tool_messages.append(
-                    ToolMessage(content=content, tool_call_id=tool_call_id)
-                )
-        except Exception as e:
-            tool_messages.append(
-                ToolMessage(content=f"[Error] {e}", tool_call_id=tool_call_id)
-            )
+                allowed_calls.append(tc)
+        else:
+            allowed_calls.append(tc)
+
+    tool_messages = []
+
+    # Add permission denied messages
+    for tc, reason in permission_denied:
+        tool_messages.append(
+            ToolMessage(content=f"[Permission Denied]: {reason}", tool_call_id=tc.get("id", ""))
+        )
+
+    # Execute allowed tools using ToolNode
+    if allowed_calls:
+        # Create a modified message with only allowed tool calls
+        from langchain_core.messages import AIMessage
+        modified_message = AIMessage(
+            content=last_message.content,
+            tool_calls=allowed_calls,
+            id=getattr(last_message, "id", None),
+        )
+        result = TOOL_NODE.invoke({"messages": [modified_message]})
+        tool_messages.extend(result.get("tool_messages", []))
 
     return {"messages": tool_messages, "tool_messages": tool_messages}
 
