@@ -1,64 +1,57 @@
-"""Bash execution tools."""
+"""Bash execution tools with YAML-based permission system."""
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from langchain_core.tools import tool
 
-
-# Dangerous commands that should be blocked
-DANGEROUS_COMMANDS = [
-    "rm -rf /",
-    "rm -rf /*",
-    "sudo shutdown",
-    "sudo reboot",
-    "init 0",
-    "init 6",
-    ":(){:|:&};:",  # Fork bomb
-]
+from minicode.tools.permission_config import (
+    get_permission_config,
+    PermissionConfig,
+)
 
 
 class BashSecurityValidator:
-    """Validate bash commands for safety."""
+    """Validate bash commands for safety using PermissionConfig."""
 
-    def __init__(self):
-        self.dangerous_patterns = DANGEROUS_COMMANDS
+    def __init__(self, config: Optional[PermissionConfig] = None):
+        self.config = config or get_permission_config()
 
     def is_safe(self, command: str) -> tuple[bool, str]:
         """Check if command is safe to execute."""
-        cmd_lower = command.lower().strip()
-
-        # Check dangerous patterns
-        for pattern in self.dangerous_patterns:
-            if pattern.lower() in cmd_lower:
-                return False, f"Dangerous command blocked: {pattern}"
-
-        # Check for destructive rm patterns
-        if "rm -rf /" in cmd_lower or "rm -rf /*" in cmd_lower:
-            return False, "Recursive delete of root blocked"
-
-        # Check for piping to eval/sh
-        if " | sh" in cmd_lower or " | bash" in cmd_lower:
-            if any(d in cmd_lower for d in ["curl", "wget"]):
-                return False, "Pipe to shell blocked for security"
-
+        allowed, reason, risk, _ = self.config.check(command)
+        if not allowed:
+            return False, reason
         return True, ""
 
 
 class BashTools:
-    """Bash execution utilities."""
+    """Bash execution utilities with permission support."""
 
-    def __init__(self, workdir: Optional[Path] = None, timeout: int = 120):
+    def __init__(
+        self,
+        workdir: Optional[Path] = None,
+        timeout: int = 120,
+        permission_callback: Optional[Callable[[str], tuple[str, str]]] = None,
+    ):
         self.workdir = workdir or Path.cwd()
         self.timeout = timeout
         self.validator = BashSecurityValidator()
+        # Callback for interactive permission prompts (used in TUI)
+        self.permission_callback = permission_callback
 
-    def run(self, command: str) -> str:
+    def run(self, command: str, interactive: bool = True) -> str:
         """Run bash command with security check."""
         # Security validation
         safe, msg = self.validator.is_safe(command)
         if not safe:
-            return f"[Error]: {msg}"
+            return f"[BLOCKED] {msg}"
+
+        # Check if needs prompt for user confirmation
+        if interactive and self.permission_callback:
+            needs, extra = self.permission_callback(command)
+            if needs == "prompt":
+                return f"[PROMPT REQUIRED] {extra}"
 
         # Execute
         try:
@@ -77,6 +70,10 @@ class BashTools:
         except Exception as e:
             return f"[Error]: {e}"
 
+    def set_permission_callback(self, callback: Callable[[str], tuple[str, str]]) -> None:
+        """Set callback for interactive permission prompts."""
+        self.permission_callback = callback
+
 
 # Global instance
 _bash_tools: Optional[BashTools] = None
@@ -94,6 +91,12 @@ def set_bash_tools(tools: BashTools) -> None:
     """Set global BashTools instance."""
     global _bash_tools
     _bash_tools = tools
+
+
+def set_permission_callback(callback: Callable[[str], tuple[str, str]]) -> None:
+    """Set permission callback for interactive prompts."""
+    tools = get_bash_tools()
+    tools.set_permission_callback(callback)
 
 
 # Tool functions

@@ -70,6 +70,14 @@ class MiniCodeTUI(App):
         self.is_thinking: bool = False
         self.sidebar_visible: bool = True
 
+        # Permission system state
+        self._pending_command: Optional[str] = None
+        self._permission_callback_result: Optional[tuple[str, str]] = None
+        self._permission_lock: Optional[asyncio.Lock] = None
+
+        # Setup permission callback for bash tools
+        self._setup_permission_system()
+
     def compose(self) -> ComposeResult:
         """Compose the application layout."""
         # Header
@@ -123,6 +131,12 @@ class MiniCodeTUI(App):
         log.write("[dim]Press Ctrl+A to toggle tools panel[/dim]\n")
         log.write("\n")
 
+        # Show permission status
+        from minicode.tools.permission_config import get_permission_config
+        config = get_permission_config()
+        summary = config.get_config_summary()
+        log.write(f"[dim]Permission system: {summary['prompt_threshold']} threshold[/dim]\n")
+
         # Update status
         self._update_status()
 
@@ -133,6 +147,83 @@ class MiniCodeTUI(App):
         if extra:
             status_text += f" | {extra}"
         center.update(status_text)
+
+    # ============ Permission System ============
+
+    def _setup_permission_system(self) -> None:
+        """Setup permission callback for bash tool."""
+        from minicode.tools.bash_tools import set_permission_callback
+        set_permission_callback(self._permission_ask)
+
+    def _permission_ask(self, command: str) -> tuple[str, str]:
+        """Ask for permission - called from bash tool.
+
+        Returns:
+            tuple of (status, message)
+            - ("allow", "") if allowed
+            - ("prompt", message) if needs user confirmation
+            - ("block", reason) if blocked
+        """
+        from minicode.tools.permission_config import get_permission_config
+
+        config = get_permission_config()
+        allowed, reason, risk, _ = config.check(command)
+
+        if not allowed:
+            return ("block", reason)
+
+        if not config.needs_prompt(command):
+            return ("allow", "")
+
+        # Need to prompt - prepare UI
+        pattern = config.extract_command_type(command)
+        message = f"Command requires permission: {command}\nRisk: {risk}\nPattern: {pattern}"
+
+        return ("prompt", message)
+
+    def _show_permission_dialog(self, command: str) -> None:
+        """Show interactive permission prompt dialog."""
+        from minicode.tools.permission_config import get_permission_config
+        from minicode.tui.dialogs import PermissionPromptDialog
+
+        config = get_permission_config()
+        allowed, reason, risk, _ = config.check(command)
+        pattern = config.extract_command_type(command)
+
+        # Store pending command
+        self._pending_command = command
+
+        # Show dialog
+        dialog = PermissionPromptDialog(
+            command=command,
+            reason=reason or "Requires confirmation",
+            risk=risk,
+            pattern=pattern,
+        )
+        self.mount(dialog)
+
+    def _handle_permission_response(self, action: str, pattern: str) -> None:
+        """Handle permission response from dialog."""
+        from minicode.tools.permission_config import get_permission_config
+
+        config = get_permission_config()
+        command = self._pending_command
+
+        if action == "session_allow" and command:
+            # Add session pattern (选项 a)
+            config.add_session_pattern(command)
+            # Post to log
+            log = self.query_one("#message-log", RichLog)
+            log.write(f"[green]✓[/green] Session allowed: {pattern}")
+
+        elif action == "deny" and command:
+            # Add to deny list (选项 d)
+            # TODO: Implement permanent deny
+            log = self.query_one("#message-log", RichLog)
+            log.write(f"[red]Added to deny list: {command}[/red]")
+
+        # Clear pending
+        self._pending_command = None
 
     # ============ Actions ============
 
@@ -232,6 +323,12 @@ class MiniCodeTUI(App):
             # 触发热重载
             self.runner.reload_config()
             log.write(f"[green]Model reloaded: {event.config['provider']}/{event.config['model']}[/green]")
+
+    def on_permission_response(self, event) -> None:
+        """Handle permission response from dialog."""
+        from minicode.tui.dialogs import PermissionResponse
+        if isinstance(event, PermissionResponse):
+            self._handle_permission_response(event.action, event.pattern)
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handle input submission."""
@@ -363,6 +460,9 @@ class MiniCodeTUI(App):
             "/time": self._cmd_time,
             "/uptime": self._cmd_uptime,
             "/cat": self._cmd_cat,
+            "/permission": self._cmd_permission,
+            "/permissions": self._cmd_permission,
+            "/perms": self._cmd_permission,
         }
 
         if cmd in commands:
@@ -397,6 +497,10 @@ class MiniCodeTUI(App):
 [bold]Model:[/bold]
 [cyan]/config[/cyan]          Unified config (show|provider|model|apikey|baseurl)
 [cyan]/theme[/cyan]          Change theme
+
+[bold]Security:[/bold]
+[cyan]/permission[/cyan]     Show permission configuration
+[cyan]/permission reload[/cyan]  Reload permission rules
 
 [bold]Tools:[/bold]
 [cyan]/tools[/cyan]          List all tools
@@ -726,6 +830,46 @@ class MiniCodeTUI(App):
         self.cat_animator.set_state("idle")
         self._update_ascii_art("idle")
         log.write("[accent]🐱 Meow![/accent]")
+
+    async def _cmd_permission(self, log: RichLog, args: str) -> None:
+        """Show permission configuration and rules."""
+        from minicode.tools.permission_tools import get_permission_rules
+
+        parts = args.split()
+        action = parts[0].lower() if parts else "show"
+
+        rules = get_permission_rules()
+        config = rules.get("config", {})
+
+        if action == "show" or action == "":
+            log.write("[bold cyan]Permission Configuration:[/bold cyan]")
+            log.write(f"  Config file: {config.get('config_path', 'N/A')}")
+            log.write(f"  Loaded: {'[green]Yes[/green]' if config.get('loaded') else '[yellow]No[/yellow]'}")
+            log.write(f"  Allow patterns: {config.get('allow_patterns', 0)}")
+            log.write(f"  Deny patterns: {config.get('deny_patterns', 0)}")
+            log.write(f"  Prompt threshold: {config.get('prompt_threshold', 'medium')}")
+            log.write("")
+            log.write("[bold]Built-in Dangerous Patterns:[/bold]")
+            for p in rules.get("builtin_patterns", []):
+                risk_color = {
+                    "critical": "[red]",
+                    "high": "[orange]",
+                    "medium": "[yellow]",
+                    "low": "[green]",
+                }.get(p["risk"], "")
+                log.write(f"  {risk_color}[{p['risk']}][/{risk_color}] {p['name']}: {p['description']}")
+            log.write("")
+            log.write("[dim]Use /permission reload to reload config[/dim]")
+            return
+
+        if action == "reload":
+            from minicode.tools.permission_tools import reset_permission_config
+            reset_permission_config()
+            log.write("[green]Permission configuration reloaded[/green]")
+            return
+
+        log.write(f"[yellow]Unknown action: {action}[/yellow]")
+        log.write("[dim]Usage: /permission show|reload[/dim]")
 
 
 async def run_tui(runner: AgentRunner) -> None:

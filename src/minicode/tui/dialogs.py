@@ -1,8 +1,10 @@
-"""Config dialog for MiniCode TUI - Single tab configuration interface."""
+"""Dialog widgets for MiniCode TUI - Config and Permission dialogs."""
 from __future__ import annotations
 
+from typing import Optional
+
 from textual.app import ComposeResult
-from textual.containers import Horizontal
+from textual.containers import Horizontal, VerticalScroll
 from textual.message import Message
 from textual.reactive import reactive
 from textual.widget import Widget
@@ -19,6 +21,16 @@ class ConfigSaved(Message):
 
     def __init__(self, config: dict) -> None:
         self.config = config
+        super().__init__()
+
+
+class PermissionResponse(Message):
+    """Message emitted when permission is decided."""
+
+    def __init__(self, command: str, action: str, pattern: str = "") -> None:
+        self.command = command
+        self.action = action  # "yes", "session_allow", "no", "deny"
+        self.pattern = pattern
         super().__init__()
 
 
@@ -203,3 +215,190 @@ class ConfigDialog(Widget):
     def result(self) -> dict:
         """Get saved configuration result."""
         return self._result
+
+
+class PermissionPromptDialog(Widget):
+    """Interactive permission prompt dialog - 选项 a/y/n/d 设计"""
+
+    CSS = """
+    PermissionPromptDialog {
+        align: center middle;
+        width: 70;
+        height: auto;
+        background: $surface;
+        border: thick $warning;
+        border-radius: 8px;
+        padding: 1 2;
+    }
+
+    PermissionPromptDialog #title-bar {
+        width: 100%;
+        height: 1;
+        background: $warning;
+        color: $text;
+        content-align: center middle;
+    }
+
+    PermissionPromptDialog #command-display {
+        width: 100%;
+        height: 3;
+        margin-bottom: 1;
+        background: $surface-darken-1;
+        border: solid $primary;
+        padding: 0 1;
+    }
+
+    PermissionPromptDialog #command-text {
+        color: $text;
+    }
+
+    PermissionPromptDialog #info-row {
+        width: 100%;
+        height: 1;
+        color: $text-muted;
+    }
+
+    PermissionPromptDialog #risk-badge {
+        color: $warning;
+    }
+
+    PermissionPromptDialog Button {
+        margin: 1 1;
+    }
+
+    PermissionPromptDialog #option-hint {
+        width: 100%;
+        color: $text-muted;
+        padding-top: 1;
+    }
+
+    PermissionPromptDialog #btn-yes {
+        background: $success;
+    }
+
+    PermissionPromptDialog #btn-session {
+        background: $primary;
+    }
+
+    PermissionPromptDialog #btn-no {
+        background: $surface-darken-1;
+    }
+
+    PermissionPromptDialog #btn-deny {
+        background: $error;
+    }
+    """
+
+    BINDINGS = [
+        ("escape", "close", "Close"),
+        ("y", "allow_once", "Allow Once"),
+        ("a", "allow_session", "Allow Type"),
+        ("n", "deny_once", "Deny Once"),
+        ("d", "deny_always", "Deny Always"),
+    ]
+
+    def __init__(self, command: str, reason: str = "", risk: str = "medium", pattern: str = ""):
+        super().__init__()
+        self.command = command
+        self.reason = reason
+        self.risk = risk
+        self.pattern = pattern
+        self._closed = False
+        self._action = None
+
+    def compose(self) -> ComposeResult:
+        """Create the dialog UI."""
+        # Title bar
+        with Horizontal(id="title-bar"):
+            yield Static("[bold]⚠ Permission Required[/bold]", id="title-text")
+
+        # Command display
+        with VerticalScroll(id="command-display"):
+            yield Static(f"Command: {self.command}", id="command-text")
+
+        # Info row
+        with Horizontal(id="info-row"):
+            risk_color = self._get_risk_color()
+            yield Static(f"{risk_color}[{self.risk}][/{risk_color}]", id="risk-badge")
+            yield Static(f"  |  {self.reason or 'Unknown command'}", id="reason-text")
+
+        # Options hint
+        yield Static(
+            "[dim]Options:[/dim] "
+            "[green][Y] Allow once[/green]  "
+            "[cyan][A] Allow type ({})[/cyan]  "
+            "[yellow][N] Deny once[/yellow]  "
+            "[red][D] Add to deny[/red]",
+            id="option-hint",
+        )
+
+        # Action buttons
+        with Horizontal(id="button-row"):
+            yield Button("Allow (y)", id="btn-yes", variant="success")
+            yield Button("Allow Type (a)", id="btn-session", variant="primary")
+            yield Button("Deny (n)", id="btn-no", variant="default")
+            yield Button("Deny+ (d)", id="btn-deny", variant="error")
+
+    def _get_risk_color(self) -> str:
+        """Get color for risk level."""
+        colors = {
+            "critical": "[red]",
+            "high": "[orange]",
+            "medium": "[yellow]",
+            "low": "[green]",
+            "none": "[dim]",
+        }
+        return colors.get(self.risk, "[yellow]")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Handle button presses."""
+        button_actions = {
+            "btn-yes": "yes",
+            "btn-session": "session_allow",
+            "btn-no": "no",
+            "btn-deny": "deny",
+        }
+        action = button_actions.get(event.button.id)
+        if action:
+            self._action = action
+            self.post_message(PermissionResponse(self.command, action, self.pattern))
+            self.action_close()
+
+    def action_close(self) -> None:
+        """Close the dialog without action."""
+        self._closed = True
+        self.remove()
+
+    def action_allow_once(self) -> None:
+        """Allow command once."""
+        self._action = "yes"
+        self.post_message(PermissionResponse(self.command, "yes", self.pattern))
+        self.action_close()
+
+    def action_allow_session(self) -> None:
+        """Allow command type (session pattern)."""
+        self._action = "session_allow"
+        self.post_message(PermissionResponse(self.command, "session_allow", self.pattern))
+        self.action_close()
+
+    def action_deny_once(self) -> None:
+        """Deny command once."""
+        self._action = "no"
+        self.post_message(PermissionResponse(self.command, "no", self.pattern))
+        self.action_close()
+
+    def action_deny_always(self) -> None:
+        """Deny command always (add to deny list)."""
+        self._action = "deny"
+        self.post_message(PermissionResponse(self.command, "deny", self.pattern))
+        self.action_close()
+
+    @property
+    def is_closed(self) -> bool:
+        """Check if dialog is closed."""
+        return self._closed
+
+    @property
+    def action(self) -> Optional[str]:
+        """Get the action that was taken."""
+        return self._action

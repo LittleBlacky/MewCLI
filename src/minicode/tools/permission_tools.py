@@ -1,65 +1,52 @@
-"""Permission management for bash commands and dangerous operations."""
-import re
+"""Permission management for bash commands - YAML-based configuration."""
 from typing import Optional
 
+from minicode.tools.permission_config import (
+    get_permission_config,
+    reset_permission_config,
+    BUILTIN_DANGEROUS_PATTERNS,
+    PermissionConfig,
+)
 
-BASH_DANGEROUS_PATTERNS = [
-    ("rm_rf_root", r"\brm\s+(-[rf]+)?\s*/\s*$", "Recursive delete of root"),
-    ("sudo_shutdown", r"\bsudo\s+(shutdown|reboot|init\s+[06])", "System shutdown/reboot"),
-    ("fork_bomb", r":\(\)\s*:\s*\|\s*:\s*&\s*;", "Fork bomb"),
-    ("dd_zero", r"\bdd\s+.*of=/dev/", "Direct disk write"),
-    ("mkfs", r"\bmkfs\b", "Filesystem format"),
-    ("curl_pipe_sh", r"curl.*\|\s*(sh|bash|fish|zsh)", "Pipe to shell"),
-    ("wget_pipe_sh", r"wget.*\|\s*(sh|bash|fish|zsh)", "Pipe to shell"),
-    ("chmod_sensitive", r"chmod\s+[47]0[47]0", "Dangerous chmod"),
-]
+
+# Re-export for backward compatibility
+BASH_DANGEROUS_PATTERNS = BUILTIN_DANGEROUS_PATTERNS
 
 
 class BashSecurityValidator:
     """Validate bash commands for security risks.
 
-    This is a more comprehensive validator than the simple one in graph.py.
-    Used by the permission system for more thorough checks.
+    Uses PermissionConfig for pattern matching.
     """
 
-    def __init__(self):
-        self.patterns = BASH_DANGEROUS_PATTERNS
-        self._compiled = [(n, re.compile(p), d) for n, p, d in self.patterns]
+    def __init__(self, config: Optional[PermissionConfig] = None):
+        self._config = config
+
+    @property
+    def config(self) -> PermissionConfig:
+        """Lazy load config."""
+        if self._config is None:
+            self._config = get_permission_config()
+        return self._config
 
     def validate(self, command: str) -> list[tuple[str, str]]:
         """Validate a command and return list of violations."""
         violations = []
-        for name, pattern, desc in self._compiled:
-            if pattern.search(command):
+        for name, pattern, risk, desc in BUILTIN_DANGEROUS_PATTERNS:
+            import re
+            if re.search(pattern, command):
                 violations.append((name, desc))
         return violations
 
     def is_safe(self, command: str) -> tuple[bool, str]:
         """Check if command is safe to execute."""
-        violations = self.validate(command)
-        if violations:
-            reasons = [v[1] for v in violations]
-            return False, "; ".join(reasons)
-        return True, ""
+        allowed, reason, _, _ = self.config.check(command)
+        return allowed, reason
 
     def get_risk_level(self, command: str) -> str:
         """Get risk level: none, low, medium, high, critical."""
-        violations = self.validate(command)
-        if not violations:
-            return "none"
-
-        names = [v[0] for v in violations]
-        critical = {"rm_rf_root", "fork_bomb", "dd_zero", "mkfs"}
-        high = {"sudo_shutdown"}
-        medium = {"curl_pipe_sh", "wget_pipe_sh"}
-
-        if critical & set(names):
-            return "critical"
-        if high & set(names):
-            return "high"
-        if medium & set(names):
-            return "medium"
-        return "low"
+        _, _, risk, _ = self.config.check(command)
+        return risk
 
     def describe_failures(self, command: str) -> str:
         """Get description of all failures."""
@@ -69,10 +56,12 @@ class BashSecurityValidator:
         return "; ".join(v[1] for v in violations)
 
 
+# Global validator instance
 bash_validator = BashSecurityValidator()
 
 
-_permission_mode = "allow"
+# Permission mode (for backward compatibility)
+_permission_mode = "deny"  # Default to deny mode for security
 
 
 def set_permission_mode(mode: str) -> None:
@@ -90,30 +79,41 @@ def get_permission_mode() -> str:
 def check_permission(command: str, tool_name: str = "bash_tool") -> tuple[bool, str]:
     """Check if a command is allowed to run.
 
+    Args:
+        command: The command to check
+        tool_name: The tool name (default: bash_tool)
+
     Returns:
         tuple of (allowed, reason)
     """
     if tool_name != "bash_tool":
         return True, ""
 
+    # Check using PermissionConfig
+    config = get_permission_config()
+    allowed, reason, risk, _ = config.check(command)
+
+    if not allowed:
+        return False, reason
+
+    # Additional check based on permission mode
     if _permission_mode == "deny":
         return False, "Permission mode is 'deny'"
 
-    safe, reason = bash_validator.is_safe(command)
-    if not safe:
-        if _permission_mode == "prompt":
-            return False, f"Requires confirmation: {reason}"
-        return False, f"Blocked: {reason}"
+    if _permission_mode == "prompt" and risk in ("high", "critical"):
+        return False, f"Requires confirmation: {reason}"
 
     return True, ""
 
 
-def get_permission_rules() -> list[dict]:
+def get_permission_rules() -> dict:
     """Get current permission rules summary."""
-    return [
-        {"mode": _permission_mode},
-        {"risk_levels": ["none", "low", "medium", "high", "critical"]},
-    ]
+    config = get_permission_config()
+    return {
+        "mode": _permission_mode,
+        "config": config.get_config_summary(),
+        "builtin_patterns": config.get_builtin_patterns(),
+    }
 
 
 # LangChain tools for registry
@@ -129,11 +129,139 @@ def set_mode(mode: str) -> str:
 
 @tool
 def check_bash_permission(command: str) -> str:
-    """Check if a bash command is safe to run."""
+    """Check if a bash command is safe to run.
+
+    Uses the YAML permission configuration to determine if the command
+    is allowed or blocked.
+    """
     allowed, reason = check_permission(command)
     if allowed:
         return f"[OK] Command is safe to execute"
     return f"[BLOCKED] {reason}"
 
 
-PERMISSION_TOOLS = [set_mode, check_bash_permission]
+@tool
+def reload_permissions() -> str:
+    """Reload permission configuration from .minicode/permissions.yaml."""
+    reset_permission_config()
+    return "Permission configuration reloaded"
+
+
+@tool
+def show_permission_rules() -> str:
+    """Show current permission rules and configuration."""
+    config = get_permission_config()
+    summary = config.get_config_summary()
+
+    lines = [
+        "# Permission Configuration",
+        f"Config file: {summary['config_path']}",
+        f"Loaded: {summary['loaded']}",
+        "",
+        f"User allow patterns: {summary['allow_patterns']}",
+        f"User deny patterns: {summary['deny_patterns']}",
+        f"Session patterns: {summary['session_patterns']} (选项 a, 会话结束失效)",
+        f"Prompt unknown: {summary['prompt_unknown']}",
+        f"Prompt threshold: {summary['prompt_threshold']}",
+        "",
+        "# Built-in Dangerous Patterns",
+    ]
+
+    for pattern in config.get_builtin_patterns():
+        lines.append(f"- [{pattern['risk']}] {pattern['name']}: {pattern['description']}")
+
+    return "\n".join(lines)
+
+
+@tool
+def add_session_allow(command: str) -> str:
+    """Allow all variants of current command type (选项 a).
+
+    Extracts the command type from the input and adds it to session patterns.
+    All commands matching this pattern will be allowed without prompting.
+
+    Example:
+        add_session_allow("rm -rf /tmp/test") -> adds "rm -rf" pattern
+        After this, "rm -rf /home/cleanup" will also be allowed
+    """
+    config = get_permission_config()
+    pattern = config.add_session_pattern(command)
+    return f"Added session pattern: {pattern}"
+
+
+@tool
+def list_session_patterns() -> str:
+    """List all current session allow patterns (选项 a)."""
+    config = get_permission_config()
+    patterns = config.get_session_patterns()
+    if not patterns:
+        return "No session patterns (use 选项 a to add)"
+    return "Session patterns:\n" + "\n".join(f"- {p}" for p in patterns)
+
+
+@tool
+def clear_session_patterns() -> str:
+    """Clear all session allow patterns."""
+    config = get_permission_config()
+    count = len(config.get_session_patterns())
+    config.clear_session_patterns()
+    return f"Cleared {count} session pattern(s)"
+
+
+def needs_prompt(command: str) -> bool:
+    """Check if a command needs to prompt user for confirmation.
+
+    Args:
+        command: The command to check
+
+    Returns:
+        True if should prompt, False if already allowed/blocked
+    """
+    config = get_permission_config()
+    return config.needs_prompt(command)
+
+
+def ask_permission(command: str) -> tuple[str, str]:
+    """Generate permission prompt message for user.
+
+    Args:
+        command: The command to check
+
+    Returns:
+        tuple of (prompt_message, suggested_pattern)
+        The suggested_pattern is extracted from the command (e.g., "rm -rf")
+    """
+    config = get_permission_config()
+    allowed, reason, risk, _ = config.check(command)
+    pattern = config.extract_command_type(command)
+
+    if not allowed:
+        action = "被阻止"
+    else:
+        action = "自动允许"
+
+    message = f"""
+命令: {command}
+原因: {reason or '未知命令'}
+风险: {risk}
+
+选项:
+  [y] 仅允许这一次
+  [a] 允许当前命令类型 ({pattern}) 的所有变体
+  [n] 仅拒绝这一次
+  [d] 永久加入 deny 列表
+
+请输入选择 (y/a/n/d):"""
+
+    return message, pattern
+
+
+PERMISSION_TOOLS = [
+    set_mode,
+    check_bash_permission,
+    reload_permissions,
+    show_permission_rules,
+    add_session_allow,
+    list_session_patterns,
+    clear_session_patterns,
+]
