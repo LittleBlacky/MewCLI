@@ -29,6 +29,11 @@ from minicode.agent.self_improve import (
 from minicode.services.checkpoint import CheckpointManager
 from minicode.services.config import get_config_manager
 from minicode.tools.hook_tools import get_hook_manager
+from minicode.tools.permission_config import (
+    PermissionConfig,
+    set_permission_config,
+    get_permission_config,
+)
 
 
 def _is_rate_limit_error(error: Exception) -> bool:
@@ -54,6 +59,7 @@ class AgentRunner:
         workdir: Optional[Path] = None,
         session_config: Optional[SessionConfig] = None,
         thread_id: str = "default",
+        permission_config: Optional[PermissionConfig] = None,
     ):
         config = get_config_manager()
         model_cfg = config.get_model_config()
@@ -69,6 +75,10 @@ class AgentRunner:
             use_sqlite=bool(db_path),
             db_path=db_path,
         )
+
+        # Inject permission config for dependency management
+        if permission_config is not None:
+            set_permission_config(permission_config)
 
         self.graph = create_agent_graph(use_checkpoint=use_checkpoint)
 

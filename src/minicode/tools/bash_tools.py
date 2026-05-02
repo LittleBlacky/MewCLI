@@ -1,7 +1,13 @@
-"""Bash execution tools with YAML-based permission system."""
+"""Bash execution tools with YAML-based permission system.
+
+Claude Code-style terminal interaction:
+- 当需要权限确认时，同步等待用户输入 y/a/n/d
+- 使用 built-in dangerous patterns 阻止危险命令
+- 支持 session patterns (选项 a) 一次性允许同类命令
+"""
 import subprocess
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Optional
 
 from langchain_core.tools import tool
 
@@ -26,34 +32,120 @@ class BashSecurityValidator:
 
 
 class BashTools:
-    """Bash execution utilities with permission support."""
+    """Bash execution utilities with terminal-style permission prompts.
+
+    Claude Code-style interaction:
+    - 同步等待用户输入 y/a/n/d
+    - 支持选项 a 允许同类命令
+    """
 
     def __init__(
         self,
         workdir: Optional[Path] = None,
         timeout: int = 120,
-        permission_callback: Optional[Callable[[str], tuple[str, str]]] = None,
     ):
         self.workdir = workdir or Path.cwd()
         self.timeout = timeout
         self.validator = BashSecurityValidator()
-        # Callback for interactive permission prompts (used in TUI)
-        self.permission_callback = permission_callback
+        # Session patterns cache (选项 a)
+        self._session_patterns: set[str] = set()
 
-    def run(self, command: str, interactive: bool = True) -> str:
-        """Run bash command with security check."""
-        # Security validation
+    def _ask_permission(self, command: str) -> tuple[str, str]:
+        """Ask user for permission in terminal - 同步阻塞等待.
+
+        Returns:
+            tuple of (action, pattern)
+            - ("allow", pattern) - 允许这一次
+            - ("session_allow", pattern) - 允许同类命令
+            - ("deny", "") - 拒绝这一次
+            - ("deny_always", "") - 加入 deny 列表（暂不支持）
+        """
+        config = get_permission_config()
+        allowed, reason, risk, matched = config.check(command)
+        pattern = config.extract_command_type(command)
+
+        # 已禁止的命令
+        if not allowed:
+            return ("block", reason)
+
+        # 检查 session patterns
+        for sp in self._session_patterns:
+            compiled = config._glob_to_regex(sp)
+            if compiled.search(command):
+                return ("session_ok", pattern)
+
+        # 检查是否需要 prompt
+        if not config.needs_prompt(command):
+            return ("allow", "")
+
+        # 需要用户确认 - 同步等待输入
+        return self._prompt_user(command, reason, risk, pattern)
+
+    def _prompt_user(self, command: str, reason: str, risk: str, pattern: str) -> tuple[str, str]:
+        """Prompt user for permission - 同步阻塞."""
+        # 颜色定义
+        colors = {
+            "critical": "\033[91m",  # 红色
+            "high": "\033[93m",      # 橙色
+            "medium": "\033[93m",    # 黄色
+            "low": "\033[92m",       # 绿色
+            "none": "\033[90m",      # 灰色
+        }
+        reset = "\033[0m"
+        bold = "\033[1m"
+
+        color = colors.get(risk, "\033[93m")
+
+        print(f"\n{bold}{color}⚠ Permission Required{reset}")
+        print(f"  Command: {command}")
+        print(f"  Reason:  {reason or 'Unknown command'}")
+        print(f"  Risk:    {color}[{risk}]{reset}")
+        print(f"  Pattern: {pattern}")
+        print()
+        print(f"{bold}Options:{reset}")
+        print(f"  [y]  Allow this once")
+        print(f"  [a]  Allow all '{pattern}' commands this session")
+        print(f"  [n]  Deny this once")
+        print(f"  [d]  Add to deny list (permanent)")
+        print()
+
+        while True:
+            try:
+                choice = input("Your choice (y/a/n/d): ").strip().lower()
+                if choice in ("y", "yes"):
+                    return ("allow", pattern)
+                elif choice in ("a", "allow-type"):
+                    # 添加到 session patterns
+                    self._session_patterns.add(pattern)
+                    config = get_permission_config()
+                    config.add_session_pattern(command)
+                    return ("session_allow", pattern)
+                elif choice in ("n", "no", ""):
+                    return ("deny", "")
+                elif choice == "d":
+                    print("  (Deny list editing via .minicode/permissions.yaml)")
+                    return ("deny", "")
+            except (KeyboardInterrupt, EOFError):
+                print("\n  Cancelled.")
+                return ("deny", "")
+
+    def run(self, command: str) -> str:
+        """Run bash command with security check and permission prompts."""
+        # Security validation (built-in dangerous patterns)
         safe, msg = self.validator.is_safe(command)
         if not safe:
             return f"[BLOCKED] {msg}"
 
-        # Check if needs prompt for user confirmation
-        if interactive and self.permission_callback:
-            needs, extra = self.permission_callback(command)
-            if needs == "prompt":
-                return f"[PROMPT REQUIRED] {extra}"
+        # Ask for permission (同步阻塞)
+        action, extra = self._ask_permission(command)
 
-        # Execute
+        if action == "block":
+            return f"[BLOCKED] {extra}"
+
+        if action == "deny":
+            return f"[DENIED] Command rejected by user"
+
+        # Execute command
         try:
             result = subprocess.run(
                 command,
@@ -70,9 +162,11 @@ class BashTools:
         except Exception as e:
             return f"[Error]: {e}"
 
-    def set_permission_callback(self, callback: Callable[[str], tuple[str, str]]) -> None:
-        """Set callback for interactive permission prompts."""
-        self.permission_callback = callback
+    def clear_session_patterns(self) -> None:
+        """Clear session patterns."""
+        self._session_patterns.clear()
+        config = get_permission_config()
+        config.clear_session_patterns()
 
 
 # Global instance
@@ -91,12 +185,6 @@ def set_bash_tools(tools: BashTools) -> None:
     """Set global BashTools instance."""
     global _bash_tools
     _bash_tools = tools
-
-
-def set_permission_callback(callback: Callable[[str], tuple[str, str]]) -> None:
-    """Set permission callback for interactive prompts."""
-    tools = get_bash_tools()
-    tools.set_permission_callback(callback)
 
 
 # Tool functions

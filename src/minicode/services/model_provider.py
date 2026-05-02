@@ -52,7 +52,7 @@ def create_chat_model(
     if api_key:
         params["api_key"] = api_key
     else:
-        raise ValueError("API Key is required! Please configure via F5 in TUI.")
+        raise ValueError("API Key is required! Set MINICODE_API_KEY env var or use /config apikey <key>")
 
     if temperature is not None:
         params["temperature"] = temperature
