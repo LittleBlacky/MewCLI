@@ -338,6 +338,17 @@ class MiniCodeTUI(App):
         if isinstance(event, PermissionResponse):
             self._handle_permission_response(event.action, event.pattern)
 
+    def on_yaml_config_saved(self, event) -> None:
+        """Handle YAML config saved event."""
+        from minicode.tui.dialogs import YAMLConfigSaved
+        if isinstance(event, YAMLConfigSaved):
+            log = self.query_one("#message-log", RichLog)
+            if event.result.get("saved"):
+                log.write(f"[green]Permission config saved! Config reloaded.[/green]")
+            else:
+                error = event.result.get("error", "Unknown error")
+                log.write(f"[red]Save failed: {error}[/red]")
+
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         """Handle input submission."""
         command = event.value.strip()
