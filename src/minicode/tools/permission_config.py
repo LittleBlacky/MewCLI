@@ -13,18 +13,31 @@ _permission_config_var: contextvars.ContextVar[Optional["PermissionConfig"]] = c
     "permission_config", default=None
 )
 
+# Module-level cache for default config (persists across calls)
+_default_config_cache: Optional["PermissionConfig"] = None
+
 
 def get_permission_config(config_path: Optional[Path] = None) -> "PermissionConfig":
     """Get PermissionConfig from context, or create with default path.
 
     Uses contextvars for thread/async safety. Set with set_permission_config().
+    Falls back to module-level cache for same-path requests.
     """
+    # First check context variable (for async safety)
     config = _permission_config_var.get()
     if config is not None:
         return config
 
-    default_path = Path.cwd() / ".minicode" / "permissions.yaml"
-    return PermissionConfig(config_path or default_path)
+    # If explicit path provided, always create new instance
+    if config_path:
+        return PermissionConfig(config_path)
+
+    # Use module-level cache for default path (singleton behavior)
+    global _default_config_cache
+    if _default_config_cache is None:
+        default_path = Path.cwd() / ".minicode" / "permissions.yaml"
+        _default_config_cache = PermissionConfig(default_path)
+    return _default_config_cache
 
 
 def set_permission_config(config: Optional["PermissionConfig"]) -> contextvars.Token:
@@ -34,6 +47,8 @@ def set_permission_config(config: Optional["PermissionConfig"]) -> contextvars.T
 
 def reset_permission_config(token: Optional[contextvars.Token] = None) -> None:
     """Reset config to None in current context. Pass token from set_permission_config() for scoped reset."""
+    global _default_config_cache
+    _default_config_cache = None  # Clear the module-level cache
     if token is not None:
         _permission_config_var.reset(token)
     else:
@@ -158,6 +173,9 @@ class PermissionConfig:
                 escaped += "\\" + c
             else:
                 escaped += c
+        # Anchor pattern to start of word boundary (after command prefix or word start)
+        # This prevents "echo hello" from matching "echo hello world" when embedded
+        # Pattern should only match at the beginning of actual command
         return re.compile(escaped, re.IGNORECASE)
 
     def _parse_risk_threshold(self) -> None:
@@ -277,15 +295,14 @@ class PermissionConfig:
         if not allowed:
             return False
 
-        # Check if matched session pattern
-        for pattern, _, _ in self._session_allowed_patterns:
-            compiled = self._glob_to_regex(pattern)
-            if compiled.search(command):
+        # Check if matched session pattern (use startswith matching)
+        for pattern, ptype, compiled in self._session_allowed_patterns:
+            if self._match_startswith(compiled, ptype, command):
                 return False  # Already allowed by session pattern
 
         # Check if matched user allow pattern
-        for _, ptype, compiled in self._allow_patterns:
-            if compiled.search(command):
+        for pattern, ptype, compiled in self._allow_patterns:
+            if self._match_startswith(compiled, ptype, command):
                 return False  # Already allowed by user config
 
         # Unknown command - check if should prompt based on config
