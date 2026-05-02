@@ -1,10 +1,43 @@
 """Permission configuration loader for YAML-based permission rules."""
+import contextvars
 import fnmatch
 import re
 from pathlib import Path
 from typing import Optional
 
 import yaml
+
+
+# Context variable for thread/async-safe config storage
+_permission_config_var: contextvars.ContextVar[Optional["PermissionConfig"]] = contextvars.ContextVar(
+    "permission_config", default=None
+)
+
+
+def get_permission_config(config_path: Optional[Path] = None) -> "PermissionConfig":
+    """Get PermissionConfig from context, or create with default path.
+
+    Uses contextvars for thread/async safety. Set with set_permission_config().
+    """
+    config = _permission_config_var.get()
+    if config is not None:
+        return config
+
+    default_path = Path.cwd() / ".minicode" / "permissions.yaml"
+    return PermissionConfig(config_path or default_path)
+
+
+def set_permission_config(config: Optional["PermissionConfig"]) -> contextvars.Token:
+    """Set PermissionConfig in current context. Returns token for reset."""
+    return _permission_config_var.set(config)
+
+
+def reset_permission_config(token: Optional[contextvars.Token] = None) -> None:
+    """Reset config to None in current context. Pass token from set_permission_config() for scoped reset."""
+    if token is not None:
+        _permission_config_var.reset(token)
+    else:
+        _permission_config_var.set(None)
 
 
 # Built-in dangerous patterns (cannot be overridden)
@@ -359,22 +392,3 @@ class PermissionConfig:
             "prompt_threshold": self._prompt_risk_threshold,
             "builtin_patterns": len(BUILTIN_DANGEROUS_PATTERNS),
         }
-
-
-# Global config instance
-_global_config: Optional[PermissionConfig] = None
-
-
-def get_permission_config(config_path: Optional[Path] = None) -> PermissionConfig:
-    """Get or create global PermissionConfig instance."""
-    global _global_config
-    if _global_config is None:
-        default_path = Path.cwd() / ".minicode" / "permissions.yaml"
-        _global_config = PermissionConfig(config_path or default_path)
-    return _global_config
-
-
-def reset_permission_config() -> None:
-    """Reset global config (for testing)."""
-    global _global_config
-    _global_config = None

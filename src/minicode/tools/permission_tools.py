@@ -3,6 +3,7 @@ from typing import Optional
 
 from minicode.tools.permission_config import (
     get_permission_config,
+    set_permission_config,
     reset_permission_config,
     BUILTIN_DANGEROUS_PATTERNS,
     PermissionConfig,
