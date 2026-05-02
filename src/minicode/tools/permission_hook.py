@@ -6,7 +6,39 @@ from minicode.tools.permission_config import (
     get_permission_config,
     reset_permission_config,
     PermissionConfig,
+    BUILTIN_DANGEROUS_PATTERNS,
 )
+
+
+class PermissionCheckResult:
+    """Result of permission check."""
+
+    def __init__(
+        self,
+        allowed: bool,
+        reason: str = "",
+        risk: str = "none",
+        matched: list[str] | None = None,
+        needs_user_input: bool = False,
+        command: str = "",
+        pattern: str = "",
+    ):
+        self.allowed = allowed
+        self.reason = reason
+        self.risk = risk
+        self.matched = matched or []
+        self.needs_user_input = needs_user_input
+        self.command = command
+        self.pattern = pattern
+
+    def to_dict(self) -> dict:
+        return {
+            "blocked": not self.allowed,
+            "block_reason": self.reason,
+            "messages": [f"Risk level: {self.risk}"] if self.risk != "none" else [],
+            "updated_input": None,
+            "needs_user_input": self.needs_user_input,
+        }
 
 
 def create_permission_checker(config_path: Optional[str] = None) -> callable:
@@ -26,6 +58,7 @@ def create_permission_checker(config_path: Optional[str] = None) -> callable:
         1. Built-in dangerous patterns (cannot be overridden)
         2. User deny patterns (from permissions.yaml)
         3. User allow patterns (from permissions.yaml)
+        4. Session patterns
         """
         # Handle both dict and string input for flexibility
         if isinstance(context, str):
@@ -37,12 +70,7 @@ def create_permission_checker(config_path: Optional[str] = None) -> callable:
             command = tool_input.get("command", "")
 
         if not command:
-            return {
-                "blocked": False,
-                "block_reason": "",
-                "messages": [],
-                "updated_input": None,
-            }
+            return {"blocked": False, "block_reason": "", "messages": [], "updated_input": None}
 
         # Load config (lazy loading)
         config = get_permission_config()
@@ -51,20 +79,32 @@ def create_permission_checker(config_path: Optional[str] = None) -> callable:
 
         allowed, reason, risk_level, matched = config.check(command)
 
-        if allowed:
-            return {
-                "blocked": False,
-                "block_reason": "",
-                "messages": [],
-                "updated_input": None,
-            }
-        else:
+        # Always block dangerous built-in patterns
+        if not allowed:
             return {
                 "blocked": True,
                 "block_reason": reason,
                 "messages": [f"Risk level: {risk_level}"],
                 "updated_input": None,
             }
+
+        # Check if needs prompt
+        needs_prompt = config.needs_prompt(command)
+        if needs_prompt:
+            pattern = config.extract_command_type(command)
+            return {
+                "blocked": False,  # Don't block, just flag for prompt
+                "block_reason": "",
+                "messages": [],
+                "updated_input": None,
+                "needs_user_input": True,
+                "command": command,
+                "pattern": pattern,
+                "reason": reason,
+                "risk": risk_level,
+            }
+
+        return {"blocked": False, "block_reason": "", "messages": [], "updated_input": None}
 
     return check_command_permission
 
@@ -95,40 +135,51 @@ def check_command_permission(context: dict) -> dict:
     Returns:
         dict with 'blocked', 'block_reason', 'messages', 'updated_input'
     """
-    # Handle both dict and string input for flexibility
-    if isinstance(context, str):
-        # If called with a command string directly
-        command = context
-        context = {}
-    else:
-        tool_input = context.get("tool_input", {})
-        command = tool_input.get("command", "")
+    return create_permission_checker()(context)
 
-    if not command:
-        return {
-            "blocked": False,
-            "block_reason": "",
-            "messages": [],
-            "updated_input": None,
-        }
 
+def check_command(command: str) -> PermissionCheckResult:
+    """Check command permission without hook context.
+
+    Args:
+        command: The command to check
+
+    Returns:
+        PermissionCheckResult with detailed information
+    """
     config = get_permission_config()
-    allowed, reason, risk_level, matched = config.check(command)
+    allowed, reason, risk, matched = config.check(command)
 
-    if allowed:
-        return {
-            "blocked": False,
-            "block_reason": "",
-            "messages": [],
-            "updated_input": None,
-        }
-    else:
-        return {
-            "blocked": True,
-            "block_reason": reason,
-            "messages": [f"Risk level: {risk_level}"],
-            "updated_input": None,
-        }
+    if not allowed:
+        return PermissionCheckResult(
+            allowed=False,
+            reason=reason,
+            risk=risk,
+            matched=matched,
+            command=command,
+        )
+
+    # Check if needs prompt
+    needs_prompt = config.needs_prompt(command)
+    pattern = config.extract_command_type(command)
+
+    if needs_prompt:
+        return PermissionCheckResult(
+            allowed=True,
+            reason=reason,
+            risk=risk,
+            needs_user_input=True,
+            command=command,
+            pattern=pattern,
+        )
+
+    return PermissionCheckResult(
+        allowed=True,
+        reason=reason,
+        risk=risk,
+        matched=matched,
+        command=command,
+    )
 
 
 def register_permission_hooks_default() -> None:
@@ -138,9 +189,13 @@ def register_permission_hooks_default() -> None:
 
 
 # Alias for compatibility
-PermissionHook = type("PermissionHook", (), {
-    "check": lambda self, cmd: (False, "Use permission_config.check() instead"),
-})()
+PermissionHook = type(
+    "PermissionHook",
+    (),
+    {
+        "check": lambda self, cmd: check_command(cmd).to_dict(),
+    },
+)()
 
 
 def get_permission_rules() -> dict:
