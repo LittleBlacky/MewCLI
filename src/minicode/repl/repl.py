@@ -23,6 +23,10 @@ except ImportError:
 
 from langchain_core.messages import HumanMessage
 
+# Import permission system
+from minicode.tools.bash_tools import set_global_permission_callback, get_bash_tools
+from minicode.tools.permission_config import get_permission_config
+
 
 class REPL:
     """Interactive REPL for the agent with @ file references and / command completion."""
@@ -73,6 +77,67 @@ class REPL:
 
         if HAS_READLINE:
             self._setup_readline()
+
+        # Set up global permission callback for REPL
+        set_global_permission_callback(self._handle_permission_prompt)
+
+    def _handle_permission_prompt(self, command: str) -> tuple[str, str]:
+        """Handle permission prompt in REPL - 同步阻塞等待.
+
+        Returns:
+            tuple of (action, pattern)
+            - ("allow", "") - 允许这一次
+            - ("session", pattern) - 允许同类命令
+            - ("deny", "") - 拒绝这一次
+            - ("permanent", pattern) - 加入永久拒绝列表
+        """
+        config = get_permission_config()
+        allowed, reason, risk, _ = config.check(command)
+        pattern = config.extract_command_type(command)
+
+        # 颜色定义
+        colors = {
+            "critical": "\033[91m",
+            "high": "\033[93m",
+            "medium": "\033[93m",
+            "low": "\033[92m",
+            "none": "\033[90m",
+        }
+        reset = "\033[0m"
+        bold = "\033[1m"
+
+        color = colors.get(risk, "\033[93m")
+
+        print(f"\n{bold}{color}⚠ Permission Required{reset}")
+        print(f"  Command: {command}")
+        print(f"  Reason:  {reason or 'Unknown command'}")
+        print(f"  Risk:    {color}[{risk}]{reset}")
+        print(f"  Pattern: {pattern}")
+        print()
+        print(f"{bold}Options:{reset}")
+        print(f"  [y]  Allow this once")
+        print(f"  [a]  Allow all '{pattern}' commands this session")
+        print(f"  [n]  Deny this once")
+        print(f"  [d]  Add to permanent deny list")
+        print()
+
+        while True:
+            try:
+                choice = input("Your choice (y/a/n/d): ").strip().lower()
+                if choice in ("y", "yes"):
+                    return ("allow", "")
+                elif choice in ("a", "allow-type"):
+                    # 添加到 session patterns
+                    config.add_session_pattern(command)
+                    return ("session", pattern)
+                elif choice in ("n", "no", ""):
+                    return ("deny", "")
+                elif choice == "d":
+                    config.add_permanent_deny(command)
+                    return ("permanent", pattern)
+            except (KeyboardInterrupt, EOFError):
+                print("\n  Cancelled.")
+                return ("deny", "")
 
     def _setup_readline(self) -> None:
         readline.set_completer(self._completer)
@@ -326,13 +391,120 @@ class REPL:
             print(f"  {i:>2}. {tool.name}")
         print()
 
-    def print_permission(self, cmd: str) -> None:
+    def print_permission(self, args: str = "") -> None:
         """Print or modify permissions."""
-        from minicode.tools.permission_tools import get_permission_mode
-        mode = get_permission_mode()
-        print("\n[权限模式]")
-        print(f"  当前: {mode}")
-        print("  用法: /permission list|allow|deny")
+        parts = args.split(maxsplit=1)
+        action = parts[0].lower() if parts else ""
+        rest = parts[1] if len(parts) > 1 else ""
+
+        config = get_permission_config()
+        summary = config.get_config_summary()
+
+        if action == "" or action == "status":
+            print("\n[权限状态]")
+            print(f"  配置文件: {summary['config_path'] or '未加载'}")
+            print(f"  已加载: {'是' if summary['loaded'] else '否'}")
+            print(f"  用户允许规则: {summary['allow_patterns']} 个")
+            print(f"  用户拒绝规则: {summary['deny_patterns']} 个")
+            print(f"  永久拒绝规则: {summary['permanent_deny_patterns']} 个")
+            print(f"  会话允许规则: {summary['session_patterns']} 个")
+            print(f"  提示未知命令: {summary['prompt_unknown']}")
+            print(f"  提示阈值: {summary['prompt_threshold']}")
+            print(f"  内置危险规则: {summary['builtin_patterns']} 个")
+            print()
+            print("  子命令:")
+            print("    /permission list         - 列出所有规则")
+            print("    /permission session      - 列出会话规则")
+            print("    /permission deny         - 列出永久拒绝规则")
+            print("    /permission clear        - 清除会话规则")
+            print("    /permission allow <cmd>  - 添加允许规则")
+            print()
+            return
+
+        if action == "list":
+            print("\n[权限规则]")
+            # 内置危险规则
+            builtin = config.get_builtin_patterns()
+            print(f"\n  内置危险规则 ({len(builtin)}):")
+            for p in builtin:
+                print(f"    [{p['risk']}] {p['name']}: {p['description']}")
+
+            # 用户允许规则
+            if summary['allow_patterns'] > 0:
+                print(f"\n  用户允许规则 ({summary['allow_patterns']}):")
+
+            # 用户拒绝规则
+            if summary['deny_patterns'] > 0:
+                print(f"\n  用户拒绝规则 ({summary['deny_patterns']}):")
+
+            # 永久拒绝规则
+            permanent = config.get_permanent_deny_patterns()
+            if permanent:
+                print(f"\n  永久拒绝规则 ({len(permanent)}):")
+                for p in permanent:
+                    print(f"    - {p}")
+            print()
+            return
+
+        if action == "session":
+            patterns = config.get_session_patterns()
+            print("\n[会话允许规则]")
+            if not patterns:
+                print("  暂无会话规则")
+                print("  使用 [a] 选项添加: 允许同类命令在当前会话中无需确认")
+            else:
+                print(f"  共 {len(patterns)} 条规则:")
+                for p in patterns:
+                    print(f"    - {p}")
+            print()
+            return
+
+        if action == "deny":
+            patterns = config.get_permanent_deny_patterns()
+            print("\n[永久拒绝规则]")
+            if not patterns:
+                print("  暂无永久拒绝规则")
+            else:
+                print(f"  共 {len(patterns)} 条规则:")
+                for p in patterns:
+                    print(f"    - {p}")
+            print()
+            return
+
+        if action == "clear":
+            count = len(config.get_session_patterns())
+            config.clear_session_patterns()
+            print(f"\n[清除] 已清除 {count} 条会话规则")
+            print()
+            return
+
+        if action == "allow":
+            if not rest:
+                print("\n[用法] /permission allow <command>")
+                print("  示例: /permission allow rm -rf")
+                print()
+                return
+            pattern = config.extract_command_type(rest)
+            config._allow_patterns.append((pattern, "glob", config._glob_to_regex(pattern)))
+            print(f"\n[添加] 已添加允许规则: {pattern}")
+            print()
+            return
+
+        if action == "remove":
+            if not rest:
+                print("\n[用法] /permission remove <pattern>")
+                print()
+                return
+            if config.remove_permanent_deny(rest):
+                print(f"\n[移除] 已从永久拒绝列表移除: {rest}")
+            else:
+                print(f"\n[未找到] 模式不存在: {rest}")
+            print()
+            return
+
+        # Unknown action
+        print(f"\n[权限] 未知命令: {action}")
+        print("  用法: /permission [status|list|session|deny|clear|allow|remove]")
         print()
 
     def print_todos(self) -> None:
@@ -781,8 +953,10 @@ class REPL:
             self.print_tools()
             return True
 
-        if cmd == "/permission":
-            self.print_permission(cmd)
+        if cmd.startswith("/permission"):
+            # Handle both /permission and /permission <args>
+            args = cmd[11:].strip()  # Strip "/permission" prefix
+            self.print_permission(args)
             return True
 
         if cmd == "/skills":
