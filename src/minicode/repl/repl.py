@@ -28,30 +28,25 @@ class REPL:
     """Interactive REPL for the agent with @ file references and / command completion."""
 
     COMMANDS = {
-        # 基础命令
         "/help": "显示帮助信息",
         "/quit": "退出程序",
         "/exit": "退出程序",
         "/clear": "清屏",
         "/status": "查看Agent状态",
 
-        # 工具与权限
         "/tools": "列出所有可用工具",
         "/permission": "管理权限 (list/allow/deny)",
 
-        # 任务与待办
         "/tasks": "查看任务列表",
         "/todos": "查看待办事项",
         "/new": "创建新任务 (用法: /new <title>)",
 
-        # 记忆与知识
         "/memory": "查看记忆系统",
         "/dream": "触发梦境整合",
         "/skills": "查看技能列表",
         "/preference": "保存偏好 (用法: /preference <key> <value>)",
         "/project": "保存项目知识 (用法: /project <key> <value>)",
 
-        # 团队协作
         "/team": "查看团队状态",
         "/teammates": "列出所有队友",
         "/spawn": "召唤新队友 (用法: /spawn <name> <role> <task>)",
@@ -59,11 +54,9 @@ class REPL:
         "/inbox": "查看收件箱",
         "/pool": "管理 Agent 池 (list/run/clear)",
 
-        # 文件操作
         "/read": "读取文件 (用法: /read <path>)",
         "/ls": "列出文件 (用法: /ls [dir])",
 
-        # 系统功能
         "/cron": "查看定时任务",
         "/hooks": "查看钩子列表",
         "/compact": "压缩对话历史",
@@ -78,29 +71,24 @@ class REPL:
         self.console = Console() if HAS_RICH else None
         self._file_cache: dict[str, str] = {}
 
-        # 设置 readline 补全
         if HAS_READLINE:
             self._setup_readline()
 
     def _setup_readline(self) -> None:
-        """设置 readline 命令补全."""
         readline.set_completer(self._completer)
         readline.parse_and_bind("tab: complete")
         readline.parse_and_bind("set show-all-if-ambiguous on")
 
     def _completer(self, text: str, state: int) -> Optional[str]:
-        """自定义命令补全."""
         if not text:
             return None
 
-        # 命令补全 (以 / 开头)
         if text.startswith("/"):
             matching = [cmd for cmd in self.COMMANDS.keys() if cmd.startswith(text)]
             if state < len(matching):
                 return matching[state]
             return None
 
-        # @ 文件补全
         if text.startswith("@"):
             base = text[1:]
             if "/" in base or "\\" in base:
@@ -404,7 +392,6 @@ class REPL:
                 status = "空闲" if tm.get("status") == "idle" else "工作中"
                 print(f"  - {tm['name']} ({tm['role']}) [{status}]")
 
-        # 显示收件箱未读消息
         inbox = bus._load_inbox()
         unread = sum(len(msgs) for msgs in inbox.values())
         if unread > 0:
@@ -488,7 +475,6 @@ class REPL:
 
         from minicode.agent.subagent import SubAgentPool
 
-        # 获取或创建全局池
         global _subagent_pool
         if '_subagent_pool' not in globals():
             globals()['_subagent_pool'] = SubAgentPool(max_agents=5)
@@ -528,12 +514,6 @@ class REPL:
             print(f"\n[池] 创建子代理 {name}...")
             agent = pool.create(name, role, task)
 
-            # 异步运行
-            async def run_agent():
-                result = await agent.run()
-                print(f"\n[池] {name} 完成:")
-                print(f"  {result[:200]}..." if len(result) > 200 else f"  {result}")
-
             import asyncio
             try:
                 asyncio.get_event_loop().run_until_complete(run_agent())
@@ -571,7 +551,6 @@ class REPL:
     def do_compact(self) -> None:
         """Compact conversation history."""
         from minicode.tools.compact_tools import compact_history
-        # 保留最近3条消息
         result = compact_history.invoke({"keep_recent": 3})
         print(f"\n[压缩] {result}")
         print()
@@ -587,7 +566,6 @@ class REPL:
         client = get_mcp_client()
 
         if action == "" or action == "list":
-            # 列出所有服务器
             servers = client.list_servers()
             if not servers:
                 print("\n[MCP] 暂无已配置的服务器")
@@ -608,9 +586,6 @@ class REPL:
             return
 
         if action == "add":
-            # 添加服务器
-            # 格式: /mcp add <name> <transport> <command> [args] [env]
-            # 示例: /mcp add filesystem stdio npx -y @modelcontextprotocol/server-filesystem C:/Temp
             if not rest:
                 print("\n[MCP] 用法: /mcp add <name> <transport> <command> [cmd_args]")
                 print("  示例: /mcp add filesystem stdio npx -y @modelcontextprotocol/server-filesystem C:/Temp")
@@ -618,7 +593,6 @@ class REPL:
                 print()
                 return
 
-            # 解析参数
             sub_parts = rest.split()
             if len(sub_parts) < 3:
                 print("\n[MCP] 参数不足，需要: <name> <transport> <command> [cmd_args]")
@@ -642,7 +616,6 @@ class REPL:
             })
             print(f"  {result}")
 
-            # 刷新并显示工具
             client.refresh()
             tools = client.get_tools()
             if tools:
@@ -902,12 +875,10 @@ class REPL:
                 if not user_input:
                     continue
 
-                # 处理 / 命令
                 if user_input.startswith("/"):
                     await self.handle_command(user_input)
                     continue
 
-                # 检查是否包含 @ 文件引用
                 if "@" in user_input:
                     files = re.findall(r'@([^\s]+)', user_input)
                     if files:
@@ -915,10 +886,8 @@ class REPL:
 
                 self.history.append(user_input)
 
-                # 展开 @ 文件引用
                 expanded = self._expand_at_references(user_input)
 
-                # 执行任务
                 print("\n[思考中...]\n")
                 messages = [HumanMessage(content=expanded)]
 

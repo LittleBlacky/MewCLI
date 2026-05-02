@@ -60,7 +60,6 @@ class PermissionConfig:
     def _load(self) -> None:
         """Load configuration from YAML file."""
         if not self.config_path or not self.config_path.exists():
-            # Use defaults
             return
 
         try:

@@ -42,13 +42,11 @@ def create_chat_model(
     config = get_config_manager()
     model_cfg = config.get_model_config()
 
-    # Fallback chain: explicit > config > env > defaults
     provider = provider or model_cfg.get("provider") or "anthropic"
     model = model or model_cfg.get("model") or "claude-sonnet-4-7"
     api_key = api_key or model_cfg.get("api_key")
     base_url = base_url or model_cfg.get("base_url")
 
-    # Build params
     params = {"timeout": timeout, "max_retries": max_retries}
 
     if api_key:

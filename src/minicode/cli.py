@@ -45,7 +45,6 @@ async def run_task(runner: AgentRunner, task: str) -> None:
     messages = [HumanMessage(content=task)]
     result = await runner.run(messages)
 
-    # Print last assistant message
     msgs = result.get("messages", [])
     for msg in reversed(msgs):
         if hasattr(msg, "content") and msg.content:
@@ -57,13 +56,11 @@ def main():
     import os
     args = parse_args()
 
-    # 只有明确传入参数时才设置环境变量，否则让 create_chat_model 从 config.json 读取
     if args.provider is not None:
         os.environ["MINICODE_PROVIDER"] = args.provider
     if args.model is not None:
         os.environ["MINICODE_MODEL"] = args.model
 
-    # Always start with TUI mode
     print("Starting MiniCode TUI...")
     from minicode.tui.app import run_tui
     runner = AgentRunner(
@@ -72,11 +69,9 @@ def main():
         thread_id=args.session,
     )
 
-    # If a task is provided, execute it then show TUI
     if args.task:
         asyncio.run(run_task(runner, args.task))
 
-    # Always show TUI
     asyncio.run(run_tui(runner))
 
 

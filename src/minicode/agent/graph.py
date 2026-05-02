@@ -214,7 +214,7 @@ def call_model(state: AgentState) -> dict:
     return {"messages": [response]}
 
 
-def execute_tools(state: AgentState) -> dict:
+async def execute_tools(state: AgentState) -> dict:
     """Tool execution node using LangGraph ToolNode."""
     messages = state.get("messages", [])
     if not messages:
@@ -280,7 +280,7 @@ def execute_tools(state: AgentState) -> dict:
             allowed_message = last_message.model_copy()
             allowed_message.tool_calls = allowed_tool_calls
 
-            result = TOOL_NODE.invoke({"messages": [allowed_message]}, runtime_config)
+            result = await TOOL_NODE.ainvoke({"messages": [allowed_message]}, runtime_config)
             all_messages = result.get("messages", [])
             tool_messages.extend([m for m in all_messages if hasattr(m, "tool_call_id")])
         except Exception as e:
