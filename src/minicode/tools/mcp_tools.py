@@ -59,6 +59,10 @@ class MCPProvider:
         if callback in self._subscribers:
             self._subscribers.remove(callback)
 
+    def is_subscribed(self, callback: Callable[[list[BaseTool]], None]) -> bool:
+        """检查回调是否已订阅."""
+        return callback in self._subscribers
+
     def _notify_changed(self) -> None:
         """通知所有订阅者工具已更新."""
         for callback in self._subscribers:

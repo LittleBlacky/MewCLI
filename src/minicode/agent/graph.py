@@ -32,6 +32,7 @@ WORKDIR = Path.cwd()
 
 TOOL_MAP: dict[str, BaseTool] = {t.name: t for t in ALL_TOOLS}
 TOOL_NODE = ToolNode(ALL_TOOLS, handle_tool_errors=True)
+_tool_lock = asyncio.Lock()  # 保护 TOOL_NODE/TOOL_MAP 的并发访问
 
 
 def _init_hooks() -> None:
@@ -39,41 +40,42 @@ def _init_hooks() -> None:
     register_permission_hooks()
 
 
-def _on_mcp_tools_changed(tools: list) -> None:
+async def _on_mcp_tools_changed(tools: list) -> None:
     """MCP tools changed callback - update TOOL_NODE."""
     global TOOL_NODE, TOOL_MAP
 
     from minicode.tools.registry import ALL_TOOLS
 
-    if tools:
-        # 合并 MCP 工具 (冲突时重命名)
-        local_names = {t.name for t in ALL_TOOLS}
-        processed = []
-        for t in tools:
-            if t.name in local_names:
-                from langchain_core.tools import StructuredTool
-                new_t = StructuredTool(
-                    name=f"mcp_{t.name}",
-                    description=t.description,
-                    args_schema=t.args_schema,
-                    coroutine=t.coroutine,
-                )
-                processed.append(new_t)
-            else:
-                processed.append(t)
+    async with _tool_lock:
+        if tools:
+            # 合并 MCP 工具 (冲突时重命名)
+            local_names = {t.name for t in ALL_TOOLS}
+            processed = []
+            for t in tools:
+                if t.name in local_names:
+                    from langchain_core.tools import StructuredTool
+                    new_t = StructuredTool(
+                        name=f"mcp_{t.name}",
+                        description=t.description,
+                        args_schema=t.args_schema,
+                        coroutine=t.coroutine,
+                    )
+                    processed.append(new_t)
+                else:
+                    processed.append(t)
 
-        renamed = len([t for t in processed if t.name.startswith("mcp_")])
-        print(f"[MCP] Tools updated: {len(processed)} tools ({renamed} renamed)")
+            renamed = len([t for t in processed if t.name.startswith("mcp_")])
+            print(f"[MCP] Tools updated: {len(processed)} tools ({renamed} renamed)")
 
-        all_tools = ALL_TOOLS + processed
-        TOOL_MAP = {t.name: t for t in all_tools}
-        TOOL_NODE = ToolNode(all_tools, handle_tool_errors=True)
-    else:
-        TOOL_MAP = {t.name: t for t in ALL_TOOLS}
-        TOOL_NODE = ToolNode(ALL_TOOLS, handle_tool_errors=True)
-        print("[MCP] Tools cleared")
+            all_tools = ALL_TOOLS + processed
+            TOOL_MAP = {t.name: t for t in all_tools}
+            TOOL_NODE = ToolNode(all_tools, handle_tool_errors=True)
+        else:
+            TOOL_MAP = {t.name: t for t in ALL_TOOLS}
+            TOOL_NODE = ToolNode(ALL_TOOLS, handle_tool_errors=True)
+            print("[MCP] Tools cleared")
 
-    reset_for_mcp_refresh()
+        reset_for_mcp_refresh()
 
 
 def refresh_mcp_tools() -> int:
@@ -85,22 +87,34 @@ def refresh_mcp_tools() -> int:
 
         provider = get_mcp_provider()
 
-        # 订阅变更事件 (如果尚未订阅)
-        if _on_mcp_tools_changed not in provider._subscribers:
+        # 使用公共方法检查订阅状态
+        if not provider.is_subscribed(_on_mcp_tools_changed):
             provider.subscribe(_on_mcp_tools_changed)
 
-        # 触发刷新
+        # 同步刷新 - 确保工具列表更新后再通知
         try:
             loop = asyncio.get_running_loop()
-            asyncio.create_task(provider.refresh())
+            # 在已有事件循环中，调度异步刷新
+            async def _do_refresh():
+                await provider.refresh()
+                # refresh() 内部已调用 _notify_changed()
+            asyncio.create_task(_do_refresh())
         except RuntimeError:
-            pass
+            # 没有运行中的事件循环（如初始化时）
+            import threading
+            def _sync_refresh():
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    try:
+                        loop.run_until_complete(provider.refresh())
+                    finally:
+                        loop.close()
+                except Exception as e:
+                    print(f"[MCP] Sync refresh failed: {e}")
+            threading.Thread(target=_sync_refresh, daemon=True).start()
 
-        tools = provider.tools
-        count = len(tools)
-        if count > 0:
-            _on_mcp_tools_changed(tools)
-        return count
+        return len(provider.tools)
 
     except Exception as e:
         print(f"[MCP] Failed to refresh tools: {e}")
@@ -296,7 +310,7 @@ def _init_mcp_subscription() -> None:
     try:
         from minicode.tools.mcp_tools import get_mcp_provider
         provider = get_mcp_provider()
-        if _on_mcp_tools_changed not in provider._subscribers:
+        if not provider.is_subscribed(_on_mcp_tools_changed):
             provider.subscribe(_on_mcp_tools_changed)
     except Exception as e:
         print(f"[MCP] Subscription init failed: {e}")
