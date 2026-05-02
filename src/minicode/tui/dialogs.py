@@ -13,6 +13,7 @@ from textual.widgets import (
     Input,
     Label,
     Static,
+    TextArea,
 )
 
 
@@ -31,6 +32,14 @@ class PermissionResponse(Message):
         self.command = command
         self.action = action  # "yes", "session_allow", "no", "deny"
         self.pattern = pattern
+        super().__init__()
+
+
+class YAMLConfigSaved(Message):
+    """Message emitted when YAML config is saved."""
+
+    def __init__(self, result: dict) -> None:
+        self.result = result
         super().__init__()
 
 
@@ -402,3 +411,159 @@ class PermissionPromptDialog(Widget):
     def action(self) -> Optional[str]:
         """Get the action that was taken."""
         return self._action
+
+
+class YAMLConfigDialog(Widget):
+    """Interactive YAML configuration editor for permissions."""
+
+    CSS = """
+    YAMLConfigDialog {
+        align: center middle;
+        width: 80;
+        height: 80%;
+        background: $surface;
+        border: thick $primary;
+        border-radius: 8px;
+        padding: 1 2;
+    }
+
+    YAMLConfigDialog #title-bar {
+        width: 100%;
+        height: 1;
+        background: $primary;
+        color: $text;
+        content-align: center middle;
+    }
+
+    YAMLConfigDialog #editor-container {
+        width: 100%;
+        height: 70%;
+        margin: 1 0;
+    }
+
+    YAMLConfigDialog #help-text {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
+
+    YAMLConfigDialog TextArea {
+        width: 100%;
+        height: 100%;
+        border: solid $primary;
+    }
+
+    YAMLConfigDialog Button {
+        margin: 0 1;
+    }
+
+    YAMLConfigDialog #btn-save {
+        background: $success;
+    }
+
+    YAMLConfigDialog #btn-cancel {
+        background: $error;
+    }
+    """
+
+    BINDINGS = [
+        ("escape", "close", "Close"),
+        ("ctrl+s", "save", "Save"),
+    ]
+
+    def __init__(self, file_path: str = ""):
+        super().__init__()
+        self._closed = False
+        self._result = None
+        self._file_path = file_path or ".minicode/permissions.yaml"
+        self._load_content()
+
+    def _load_content(self) -> None:
+        """Load current YAML content."""
+        from pathlib import Path
+        path = Path(self._file_path)
+        if path.exists():
+            try:
+                self._content = path.read_text(encoding="utf-8")
+            except Exception:
+                self._content = ""
+        else:
+            self._content = ""
+
+    def compose(self) -> ComposeResult:
+        """Create the dialog UI."""
+        # Title bar
+        with Horizontal(id="title-bar"):
+            yield Static("[bold]Permission Config Editor[/bold]", id="title-text")
+            yield Static(f"[dim]  |  {self._file_path}  |  Esc: Close  |  Ctrl+S: Save[/dim]")
+
+        # Help text
+        yield Static(
+            "[dim]支持 glob 模式 (*, ?) 和正则 (re:pattern)[/dim]",
+            id="help-text",
+        )
+
+        # Editor
+        with Vertical(id="editor-container"):
+            yield TextArea(
+                self._content,
+                id="yaml-editor",
+                language="yaml",
+            )
+
+        # Action buttons
+        with Horizontal(id="button-row"):
+            yield Button("Cancel", id="btn-cancel", variant="error")
+            yield Button("Save (Ctrl+S)", id="btn-save", variant="success")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Handle button presses."""
+        if event.button.id == "btn-cancel":
+            self.action_close()
+        elif event.button.id == "btn-save":
+            self.action_save()
+
+    def action_close(self) -> None:
+        """Close the dialog."""
+        self._closed = True
+        self.remove()
+
+    def action_save(self) -> None:
+        """Save configuration and close."""
+        from pathlib import Path
+        import yaml
+
+        try:
+            editor = self.query_one("#yaml-editor", TextArea)
+            content = editor.text
+
+            # Validate YAML
+            yaml.safe_load(content)
+
+            # Save to file
+            path = Path(self._file_path)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content, encoding="utf-8")
+
+            self._result = {"saved": True, "path": self._file_path}
+            self.post_message(YAMLConfigSaved(self._result))
+
+            # Reload permission config
+            from minicode.tools.permission_config import reset_permission_config
+            reset_permission_config()
+
+        except yaml.YAMLError as e:
+            self._result = {"error": f"Invalid YAML: {e}"}
+        except Exception as e:
+            self._result = {"error": str(e)}
+
+        self.action_close()
+
+    @property
+    def is_closed(self) -> bool:
+        """Check if dialog is closed."""
+        return self._closed
+
+    @property
+    def result(self) -> Optional[dict]:
+        """Get save result."""
+        return self._result

@@ -55,6 +55,7 @@ class MiniCodeTUI(App):
         Binding("f3", "show_history", "History", show=True),
         Binding("f4", "show_session", "Session", show=True),
         Binding("f5", "show_config", "Config", show=True),
+        Binding("f6", "edit_permissions", "PermEdit", show=True),
     ]
 
     def __init__(self, runner: AgentRunner, **kwargs):
@@ -109,7 +110,7 @@ class MiniCodeTUI(App):
             yield Static("MiniCode", id="status-left")
             yield Static("", id="status-center")
             yield Static(
-                "F5:配置  |  Ctrl+K: 命令  |  Ctrl+L: 清屏",
+                "F5:配置  |  F6:权限  |  Ctrl+K: 命令  |  Ctrl+L: 清屏",
                 id="status-right",
             )
 
@@ -307,6 +308,13 @@ class MiniCodeTUI(App):
         dialog = ConfigDialog()
         self.mount(dialog)
 
+    def action_edit_permissions(self) -> None:
+        """Open YAML permission config editor."""
+        from minicode.tui.dialogs import YAMLConfigDialog
+        config_path = ".minicode/permissions.yaml"
+        dialog = YAMLConfigDialog(config_path)
+        self.mount(dialog)
+
     def action_suspend(self) -> None:
         """Suspend execution."""
         pass  # TODO: Implement
@@ -501,6 +509,8 @@ class MiniCodeTUI(App):
 [bold]Security:[/bold]
 [cyan]/permission[/cyan]     Show permission configuration
 [cyan]/permission reload[/cyan]  Reload permission rules
+[cyan]/permission edit[/cyan]   Edit permissions.yaml
+[cyan]/permission clear-session[/cyan]  Clear session patterns
 
 [bold]Tools:[/bold]
 [cyan]/tools[/cyan]          List all tools
@@ -517,6 +527,8 @@ class MiniCodeTUI(App):
 [bold]Keyboard Shortcuts:[/bold]
 [cyan]Ctrl+K[/cyan]          Command palette
 [cyan]Ctrl+L[/cyan]          Clear screen
+[cyan]F5[/cyan]              Config
+[cyan]F6[/cyan]              Permission Editor
 [cyan]Ctrl+R[/cyan]          Recall last command
 [cyan]Ctrl+A[/cyan]          Toggle tools panel
 [cyan]Ctrl+E[/cyan]          Toggle mode
@@ -895,8 +907,12 @@ class MiniCodeTUI(App):
             log.write("[green]Session patterns cleared[/green]")
             return
 
+        if action == "edit":
+            self.action_edit_permissions()
+            return
+
         log.write(f"[yellow]Unknown action: {action}[/yellow]")
-        log.write("[dim]Usage: /permission show|reload|clear-session[/dim]")
+        log.write("[dim]Usage: /permission show|reload|clear-session|edit[/dim]")
 
 
 async def run_tui(runner: AgentRunner) -> None:
