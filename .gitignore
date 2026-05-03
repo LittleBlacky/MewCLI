@@ -37,7 +37,6 @@ ENV/
 # Project specific
 .minicode/
 demo/
-docs/
 *.db
 *.sqlite
 *.sqlite3
