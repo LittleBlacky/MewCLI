@@ -216,7 +216,36 @@ async def worker_node(state: AgentState) -> AgentState:
 
 ---
 
-## 6. 与其他模块集成
+## 6. 与 ReAct 子图集成
+
+Worker Agent 使用共用的 ReAct 子图执行工具调用循环：
+
+```python
+class WorkerAgent:
+    def __init__(self):
+        from core.agent.react import build_react_graph
+        self.react_graph = build_react_graph()
+
+    async def execute_task(self, task: Task) -> str:
+        """使用 ReAct 子图执行任务"""
+        session = SessionContext(thread_id=self.thread_id)
+        session.add_message(Message(role="system", content=WORKER_SYSTEM_PROMPT))
+
+        result = await self.react_graph.ainvoke({
+            "session": session,
+            "task": task.description,
+            "tool_results": [],
+            "should_continue": True,
+        })
+
+        return result["session"].messages[-1].content
+```
+
+详见：[react.md](react.md)（完整实现、容量管理、与 Lead 集成说明）
+
+---
+
+## 7. 与其他模块集成
 
 ### 6.1 与 Team Manager 集成
 
@@ -260,4 +289,5 @@ Team Manager ──dispatch──> Worker
 
 - [base.md](base.md) - 核心类型定义
 - [lead.md](lead.md) - Lead Agent 实现
+- [react.md](react.md) - ReAct 子图（Lead/Worker 共用）
 - [../team/index.md](../team/index.md) - Team 协作架构

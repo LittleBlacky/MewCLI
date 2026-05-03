@@ -10,8 +10,9 @@
 
 | 文档 | 文件路径 | 核心内容 |
 |------|----------|----------|
-| **base** | `core/agent/base.md` | 核心类型定义（AgentRole、Task、Message 等） |
-| **state** | `core/agent/state.md` | Agent 状态机定义 |
+| **base** | `core/agent/base.md` | 核心类型定义（AgentRole、Task、Message、AgentState 等） |
+| **plan_and_solve** | `core/agent/plan_and_solve.md` | 执行模式（Plan-and-Solve） |
+| **react** | `core/agent/react.md` | ReAct 子图（Lead/Worker 共用） |
 | **lead** | `core/agent/lead.md` | Lead Agent 实现（理解、分解、汇总） |
 | **worker** | `core/agent/worker.md` | Worker Agent 实现（执行任务） |
 | **protocol** | `core/agent/protocol.md` | Agent 间通信协议 |
@@ -23,8 +24,9 @@
 ```
 core/agent/
 ├── __init__.py          # 导出公共类型
-├── base.py              # 核心类型定义（AgentRole、Task、Message 等）
-├── state.py             # Agent 状态定义
+├── base.py              # 核心类型定义（AgentRole、Task、Message、AgentState 等）
+├── mode.py              # 执行模式（ReAct / Plan-and-Solve）
+├── react.py             # ReAct 子图（Lead/Worker 共用）
 ├── lead.py              # Lead Agent 实现
 ├── worker.py            # Worker Agent 实现
 └── protocol.py          # Agent 协作协议
