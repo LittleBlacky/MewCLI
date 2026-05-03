@@ -39,17 +39,19 @@
 
 ### 2.3 技术决策
 
-| 维度      | 选择         | 说明                                |
-| --------- | ------------ | ----------------------------------- |
-| LangGraph | 核心框架     | 作为核心的状态管理和流程控制框架    |
-| MVP 范围  | 多 Agent MVP | Lead + N 个 Worker，动态分配        |
-| 记忆实现  | 三层记忆     | Preference + Knowledge + Episodic   |
-| 重构策略  | 全新设计     | 删除旧代码，重新设计目录结构        |
-| 目录结构  | 按职责分     | core/agent、core/memory/、infra/ 等 |
-| 任务分解  | 智能分解     | Agent 决定怎么分解，用 LLM 推理     |
-| 进化时机  | 实时进化     | 任务完成后立即分析并学习            |
-| Prompt 缓存 | 支持多厂商   | 静态内容缓存降低成本（详见架构文档）|
-| 资源隔离  | 混合方案     | Context 隔离，Memory/Skill/Tool 共享 |
+| 维度        | 选择         | 说明                                 |
+| ----------- | ------------ | ------------------------------------ |
+| LangGraph   | 核心框架     | 作为核心的状态管理和流程控制框架     |
+| MVP 范围    | 多 Agent MVP | Lead + N 个 Worker，动态分配         |
+| 记忆实现    | 三层记忆     | Preference + Knowledge + Episodic    |
+| 重构策略    | 全新设计     | 删除旧代码，重新设计目录结构         |
+| 目录结构    | 按职责分     | core/agent、core/memory/、infra/ 等  |
+| 任务分解    | 智能分解     | Agent 决定怎么分解，用 LLM 推理      |
+| 进化时机    | 实时进化     | 任务完成后立即分析并学习             |
+| Prompt 缓存 | 支持多厂商   | 静态内容缓存降低成本（详见架构文档） |
+| 资源隔离    | 混合方案     | Context 隔离，Memory/Skill/Tool 共享 |
+| 执行模式    | ReAct + Plan-and-Solve | 支持两种模式，可配置切换 |
+| 工具实现    | 异步优先               | Bash 工具使用 asyncio，多 Worker 并行依赖 |
 
 ### 2.4 核心概念定义
 
@@ -300,26 +302,26 @@
 
 **组件职责速查表**：
 
-| 层级 | 组件 | 职责 | 关键数据/方法 |
-|------|------|------|--------------|
-| **Presentation** | REPL | 用户交互 | Input/Parser/Formatter/Output |
-| **Orchestration** | SessionManager | 会话生命周期 | SessionContext/SessionConfig |
-| **Orchestration** | TeamManager | Agent 协调 | WorkerPool/Inbox/Protocol |
-| **Agent** | LeadAgent | 任务理解分解 | AgentState/understand/decompose/summarize |
-| **Agent** | WorkerAgent | 子任务执行 | execute/use_tools/report |
-| **Tool** | ToolRegistry | 工具管理 | File/Bash/Search/Permission/MCP |
-| **Infra** | GraphBuilder | 状态图构建 | add_node/add_edge/compile |
-| **Infra** | Checkpoint | 断点持久化 | save/load/should_checkpoint |
-| **Infra** | HookSystem | 生命周期钩子 | register/emit/priority |
-| **Infra** | Metrics | 指标收集 | TeamMetrics/PerfMetrics/MemMetrics |
-| **Infra** | PromptCache | 缓存静态内容 | build_messages/cache_control |
-| **Memory** | Preference | 用户偏好 | tab_size/theme/commands |
-| **Memory** | Knowledge | 项目知识 | project_dir/tech_stack/patterns |
-| **Memory** | Episodic | 事件记忆 | task_id/event/timestamp |
-| **Memory** | Dream | 记忆整合 | trigger/merge/dedup |
-| **Evolution** | EvolutionEngine | 进化控制 | TaskEvaluator/LLMChecker/SkillSynth |
-| **Evolution** | SkillRegistry | 技能管理 | register/list/get/save |
-| **Evolution** | SkillMatcher | 技能匹配 | match/score/get_top |
+| 层级              | 组件            | 职责         | 关键数据/方法                             |
+| ----------------- | --------------- | ------------ | ----------------------------------------- |
+| **Presentation**  | REPL            | 用户交互     | Input/Parser/Formatter/Output             |
+| **Orchestration** | SessionManager  | 会话生命周期 | SessionContext/SessionConfig              |
+| **Orchestration** | TeamManager     | Agent 协调   | WorkerPool/Inbox/Protocol                 |
+| **Agent**         | LeadAgent       | 任务理解分解 | AgentState/understand/decompose/summarize |
+| **Agent**         | WorkerAgent     | 子任务执行   | execute/use_tools/report                  |
+| **Tool**          | ToolRegistry    | 工具管理     | File/Bash/Search/Permission/MCP           |
+| **Infra**         | GraphBuilder    | 状态图构建   | add_node/add_edge/compile                 |
+| **Infra**         | Checkpoint      | 断点持久化   | save/load/should_checkpoint               |
+| **Infra**         | HookSystem      | 生命周期钩子 | register/emit/priority                    |
+| **Infra**         | Metrics         | 指标收集     | TeamMetrics/PerfMetrics/MemMetrics        |
+| **Infra**         | PromptCache     | 缓存静态内容 | build_messages/cache_control              |
+| **Memory**        | Preference      | 用户偏好     | tab_size/theme/commands                   |
+| **Memory**        | Knowledge       | 项目知识     | project_dir/tech_stack/patterns           |
+| **Memory**        | Episodic        | 事件记忆     | task_id/event/timestamp                   |
+| **Memory**        | Dream           | 记忆整合     | trigger/merge/dedup                       |
+| **Evolution**     | EvolutionEngine | 进化控制     | TaskEvaluator/LLMChecker/SkillSynth       |
+| **Evolution**     | SkillRegistry   | 技能管理     | register/list/get/save                    |
+| **Evolution**     | SkillMatcher    | 技能匹配     | match/score/get_top                       |
 
 ### 3.2 架构分层
 
@@ -353,7 +355,7 @@
 **State 设计**：
 
 ```
-GraphState (infra/graph.py - 基础设施层)
+GraphState (infra/graph - 基础设施层)
     └── AgentState (core/agent/state.py - Agent 层，使用 add_messages)
 ```
 
@@ -409,12 +411,12 @@ User Input
 
 **隔离规则（混合方案）**：
 
-| 资源       | Lead Agent | Worker Agent |
-| ---------- | ---------- | ------------- |
+| 资源        | Lead Agent          | Worker Agent           |
+| ----------- | ------------------- | ---------------------- |
 | **Context** | 完整 SessionContext | SubtaskContext（隔离） |
-| **Memory**  | 读写（创建/更新） | 只读（检索） |
-| **Skill**   | 读写（创建/更新） | 只读（匹配/使用） |
-| **Tool**    | 全部工具 + 权限管理 | 全部工具 |
+| **Memory**  | 读写（创建/更新）   | 只读（检索）           |
+| **Skill**   | 读写（创建/更新）   | 只读（匹配/使用）      |
+| **Tool**    | 全部工具 + 权限管理 | 全部工具               |
 
 ---
 
@@ -453,6 +455,29 @@ Evolution Engine 调用 Skill 模块管理技能，而非自行处理。
 
 Hook 位于 `infra/hook/`，提供通用生命周期扩展点。
 
+#### 双轨制设计
+
+| 类型 | 注册方式 | 执行方式 | 示例 |
+|------|----------|----------|------|
+| **内置 Hook** | `@auto_hook` 装饰器 | Python 函数 | logging、metrics、permission |
+| **用户配置 Hook** | `.minicode/hooks.json` | 外部命令 | 用户自定义验证 |
+
+#### 模块结构
+
+```
+infra/hook/
+├── __init__.py              # 导出公共类型
+├── registry.py              # Hook 注册表 + @auto_hook 装饰器
+├── types.py                 # Hook 类型定义
+├── config.py                # 用户配置加载
+└── builtin/                 # 内置 Hook（@auto_hook 自动注册）
+    ├── logging.py           # 日志 Hook（priority=10）
+    ├── metrics.py           # 指标 Hook（priority=20）
+    └── permission.py        # 权限 Hook（priority=100）
+```
+
+#### 优先级
+
 ```python
 class HookPriority:
     LOGGING = 10       # 日志记录
@@ -463,12 +488,27 @@ class HookPriority:
     PLUGIN = 400       # 插件钩子
 ```
 
+#### Hook 类型
+
 | Hook 类型     | 说明           |
 | ------------- | -------------- |
 | `TOOL_*`      | 工具执行前后   |
 | `AGENT_*`     | Agent 生命周期 |
 | `SESSION_*`   | 会话生命周期   |
 | `EVOLUTION_*` | 进化生命周期   |
+
+#### 用户配置示例
+
+```json
+// .minicode/hooks.json
+{
+    "hooks": {
+        "PreToolUse": [
+            {"matcher": "bash", "command": "python verify_bash.py"}
+        ]
+    }
+}
+```
 
 ### 4.5 State 设计
 
@@ -525,33 +565,33 @@ Session 管理用户会话的生命周期，包括上下文、状态追踪和持
 
 Prompt 缓存通过将静态内容（系统提示、知识库、技能）缓存以降低 API 成本。
 
-| 可缓存内容 | 缓存 | 说明 |
-|-----------|------|------|
-| System Prompt | ✅ | 固定不变 |
-| 项目知识 | ✅ | 相对稳定 |
-| 技能定义 | ✅ | 很少变化 |
-| 用户偏好 | ✅ | 长期有效 |
-| 对话历史 | ❌ | 动态变化 |
-| 当前输入 | ❌ | 每次不同 |
+| 可缓存内容    | 缓存 | 说明     |
+| ------------- | ---- | -------- |
+| System Prompt | ✅   | 固定不变 |
+| 项目知识      | ✅   | 相对稳定 |
+| 技能定义      | ✅   | 很少变化 |
+| 用户偏好      | ✅   | 长期有效 |
+| 对话历史      | ❌   | 动态变化 |
+| 当前输入      | ❌   | 每次不同 |
 
 **多厂商支持**：
 
-| 厂商 | 支持程度 | 机制 |
-|------|----------|------|
+| 厂商          | 支持程度    | 机制                                                      |
+| ------------- | ----------- | --------------------------------------------------------- |
 | **Anthropic** | ✅ 完全支持 | `cache_breakpoint` + `cache_control: {type: "ephemeral"}` |
-| **OpenAI** | ✅ 支持 | `cache_control` with `ephemeral` |
-| **Google** | ⚠️ 部分支持 | 查看 Vertex AI 文档 |
-| **其他** | ❌ 回退 | 缓存内容作为系统提示 |
+| **OpenAI**    | ✅ 支持     | `cache_control` with `ephemeral`                          |
+| **Google**    | ⚠️ 部分支持 | 查看 Vertex AI 文档                                       |
+| **其他**      | ❌ 回退     | 缓存内容作为系统提示                                      |
 
 **核心组件**：
 
-| 组件 | 说明 | 位置 |
-|------|------|------|
-| **PromptCache** | 管理缓存内容构建 | `infra/cache/prompt.py` |
+| 组件                   | 说明                             | 位置                    |
+| ---------------------- | -------------------------------- | ----------------------- |
+| **PromptCache**        | 管理缓存内容构建                 | `infra/cache/prompt.py` |
 | **CacheBudgetManager** | 管理缓存 Token 预算（最大 200K） | `infra/cache/budget.py` |
-| **CacheAdapter** | 厂商适配器（抽象基类） | 详见架构文档 |
+| **CacheAdapter**       | 厂商适配器（抽象基类）           | 详见架构文档            |
 
-**详细设计**：见 `docs/architecture/07_infrastructure.md` 第 4.4 节。
+**详细设计**：见 `docs/architecture/infra/hook.md` 第 3 节。
 
 ---
 
@@ -753,7 +793,6 @@ class MetricsCollector:
 - LangGraph 文档
 - MiniCode MVP 实现
 - CrewAI 架构
-- STAR 原则求职技巧
 
 ### 8.5 相关文档
 
