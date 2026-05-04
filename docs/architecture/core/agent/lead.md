@@ -52,16 +52,41 @@ Lead Agent
 
 ---
 
-## 3. 智能分解策略
+## 3. Lead Agent 核心方法
 
-Lead Agent 使用 LLM 进行任务分解，根据任务特点动态决定：
+### 4.1 理解用户意图
 
 ```python
-from core.agent.base import SubTask, DecompositionResult
+async def understand(self, user_input: str) -> str:
+    """理解用户意图"""
+    # 1. 检索相关记忆
+    memories = self.memory.retrieve(user_input)
 
-async def decompose_task(self, task: str) -> list[Task]:
+    # 2. 构建上下文
+    context = self._build_context(user_input, memories)
+
+    # 3. LLM 推理
+    return await self.llm.think(context)
+
+def _build_context(self, user_input: str, memories: dict) -> str:
+    """构建上下文"""
+    parts = [f"# 用户输入\n{user_input}"]
+
+    if memories.get("preference"):
+        parts.append(f"\n# 用户偏好\n{memories['preference']}")
+    if memories.get("knowledge"):
+        parts.append(f"\n# 项目知识\n{memories['knowledge']}")
+    if memories.get("episodic"):
+        parts.append(f"\n# 相关经验\n{memories['episodic']}")
+
+    return "\n\n".join(parts)
+```
+
+### 4.2 智能分解任务
+
+```python
+async def decompose(self, task: str) -> list[Task]:
     """智能分解任务（结构化输出 + 验证 + 重试）"""
-
     max_retries = 3
 
     for attempt in range(max_retries):
@@ -71,328 +96,92 @@ async def decompose_task(self, task: str) -> list[Task]:
                 prompt=f"任务: {task}\n\n请判断并分解..."
             )
 
-            # 验证通过，直接使用
+            # 不需要分解，直接返回原任务
             if not result.should_decompose:
                 return [Task(description=task)]
 
-            return self.build_tasks(result.subtasks)
+            # 构建任务列表
+            return self._build_tasks(result.subtasks)
 
-        except ValidationError as e:
-            if attempt < max_retries - 1:
-                logger.warning(f"分解结果验证失败，重试 ({attempt + 1}/{max_retries}): {e}")
-                continue
-            else:
-                logger.warning(f"分解结果验证失败，执行原任务: {e}")
-                return [Task(description=task)]
+        except Exception as e:
+            logger.warning(f"分解结果验证失败，重试 ({attempt + 1}/{max_retries}): {e}")
+            continue
+
+    # 全部失败，返回原任务
+    return [Task(description=task)]
+
+def _build_tasks(self, subtasks: list[SubTask]) -> list[Task]:
+    """根据子任务定义构建任务对象"""
+    tasks = []
+    for i, st in enumerate(subtasks):
+        task = Task(
+            id=f"task_{i}",
+            description=st.description,
+            status=TaskStatus.PENDING,
+            created_at=time.time(),
+        )
+        for dep_id in st.dependencies:
+            task.children_ids.append(dep_id)
+        tasks.append(task)
+    return tasks
 ```
 
-**关键设计**：
-
-| 设计点                     | 说明                              |
-| -------------------------- | --------------------------------- |
-| **Pydantic 约束**          | 定义输出 schema，LLM 必须严格遵守 |
-| **重试机制**               | 最多 3 次，失败后执行原任务       |
-| **with_structured_output** | LangChain 原生支持结构化输出      |
-
----
-
-**分解决策示例**
-
-| 任务类型   | 分解策略                       | 子任务数量  |
-| ---------- | ------------------------------ | ----------- |
-| "修复 bug" | 分析→复现→修复→测试            | 4           |
-| "实现功能" | 分析→设计→实现→测试→集成       | 5           |
-| "代码审查" | 按文件分解，每个文件一个子任务 | N（文件数） |
-| "重构"     | 分析→规划→执行→验证            | 4           |
-
----
-
-## 4. Lead Agent 核心方法
+### 4.3 分配任务
 
 ```python
-from core.agent.base import SubTask, DecompositionResult
+async def assign(self, subtasks: list[Task]) -> dict[str, str]:
+    """分配任务给 Workers"""
+    assignments = {}
+    for task in subtasks:
+        worker_id = await self.team_manager.assign_task(task)
+        assignments[task.id] = worker_id
+    return assignments
+```
 
+### 4.4 汇总结果
 
-class LeadAgent:
-    """Lead Agent 实现"""
+```python
+async def aggregate(self, results: dict[str, TaskResult]) -> str:
+    """汇总 Worker 结果"""
+    # 1. 合并所有结果
+    combined = "\n".join(r.result for r in results.values() if r.success)
 
-    def __init__(self):
-        self.memory = get_memory_layer()
-        self.llm = get_model()
-        self.team_manager = TeamManager()
-
-    async def understand(self, user_input: str) -> str:
-        """理解用户意图"""
-        # 1. 检索相关记忆
-        memories = self.memory.retrieve(user_input)
-
-        # 2. 构建上下文
-        context = self.build_context(user_input, memories)
-
-        # 3. LLM 推理
-        return await self.llm.think(context)
-
-    async def build_context(self, user_input: str, memories: dict) -> str:
-        """构建上下文"""
-        parts = [f"# 用户输入\n{user_input}"]
-
-        # 添加记忆
-        if memories.get("preference"):
-            parts.append(f"\n# 用户偏好\n{memories['preference']}")
-
-        if memories.get("knowledge"):
-            parts.append(f"\n# 项目知识\n{memories['knowledge']}")
-
-        if memories.get("episodic"):
-            parts.append(f"\n# 相关经验\n{memories['episodic']}")
-
-        return "\n\n".join(parts)
-
-    async def decompose(self, task: str) -> list[Task]:
-        """智能分解任务（结构化输出 + 验证 + 重试）"""
-
-        max_retries = 3
-
-        for attempt in range(max_retries):
-            try:
-                result = await self.llm.with_structured_output(
-                    DecompositionResult,
-                    prompt=f"任务: {task}\n\n请判断并分解..."
-                )
-
-                # 不需要分解，直接返回原任务
-                if not result.should_decompose:
-                    return [Task(description=task)]
-
-                # 构建任务列表
-                return self.build_tasks(result.subtasks)
-
-            except ValidationError as e:
-                if attempt < max_retries - 1:
-                    # 未达最大重试次数，尝试重新分解
-                    logger.warning(f"分解结果验证失败，重试 ({attempt + 1}/{max_retries}): {e}")
-                    continue
-                else:
-                    # 最后一次失败，执行原任务
-                    logger.warning(f"分解结果验证失败，执行原任务: {e}")
-                    return [Task(description=task)]
-
-    async def build_tasks(self, subtasks: list[SubTask]) -> list[Task]:
-        """根据子任务定义构建任务对象"""
-        tasks = []
-        for i, st in enumerate(subtasks):
-            task = Task(
-                id=f"task_{i}",
-                description=st.description,
-                status=TaskStatus.PENDING,
-                created_at=time.time(),
-            )
-            # 设置依赖关系
-            for dep_id in st.dependencies:
-                task.children_ids.append(dep_id)
-            tasks.append(task)
-        return tasks
-
-    async def assign(self, subtasks: list[Task]) -> dict[str, str]:
-        """分配任务给 Workers"""
-        assignments = {}
-        for task in subtasks:
-            worker_id = await self.team_manager.assign_task(task)
-            assignments[task.id] = worker_id
-        return assignments
-
-    async def aggregate(self, results: dict[str, TaskResult]) -> str:
-        """汇总 Worker 结果"""
-        # 1. 合并所有结果
-        combined = "\n".join(r.result for r in results.values() if r.success)
-
-        # 2. 生成最终回复
-        prompt = f"合并以下结果并生成最终回复：\n{combined}"
-        return await self.llm.think(prompt)
+    # 2. 生成最终回复
+    prompt = f"合并以下结果并生成最终回复：\n{combined}"
+    return await self.llm.think(prompt)
 ```
 
 ---
 
-## 5. LangGraph 节点实现
+## 4. LangGraph 节点实现
 
-Lead Agent 使用 LangGraph 状态图来管理执行流程：
+节点实现详见第4节源码 `build_lead_graph()` 函数。
 
 ### 5.1 状态定义
 
 ```python
-from infra.graph import AgentState as BaseAgentState
-from core.session import SessionContext
-
-class LeadGraphState(BaseAgentState):
-    """Lead Agent 执行图状态 - 继承 AgentState，使用 SessionContext"""
-    session: SessionContext                   # 会话上下文（已包含容量管理）
-    task: Optional[str]                       # 理解后的任务描述
-    should_decompose: bool                    # 是否需要分解
-    subtasks: list[Task]                      # 子任务列表
-    results: dict[str, TaskResult]            # Worker 结果
-    final_response: Optional[str]             # 最终回复
+class LeadGraphState(TypedDict):
+    session: SessionContext
+    task: Optional[str]
+    should_decompose: bool
+    subtasks: list[Task]
+    assignments: dict[str, str]          # {task_id: worker_id}
+    results: dict[str, TaskResult]       # {worker_id: result}
+    final_response: Optional[str]
 ```
 
-### 5.2 节点定义
+### 5.2 节点列表
 
-```python
-from langgraph.graph import StateGraph, END
-from core.session import SessionContext
-from core.agent.base import SubTask, DecompositionResult, ComplexityResult
-from tool.registry import get_registry
+| 节点 | 函数 | 说明 |
+|------|------|------|
+| understand | `understand_node` | 理解用户意图 |
+| should_decompose | `should_decompose_node` | 判断是否需要分解 |
+| decompose | `decompose_node` | 分解任务 |
+| execute_direct | `execute_direct_node` | 调用 ReAct 执行 |
+| assign_tasks | `assign_tasks_node` | 分配给 Workers |
+| aggregate | `aggregate_node` | 汇总结果 |
 
-# 节点 1: 理解用户意图
-async def understand_node(state: LeadGraphState) -> LeadGraphState:
-    """理解用户意图"""
-    from core.memory import get_memory_layer
-
-    user_input = state["messages"][-1].content
-    memory = get_memory_layer()
-    session: SessionContext = state["session"]
-
-    # 1. 检索相关记忆
-    memories = memory.retrieve(user_input)
-
-    # 2. 构建上下文
-    context_parts = [f"# 用户输入\n{user_input}"]
-    if memories.get("preference"):
-        context_parts.append(f"\n# 用户偏好\n{memories['preference']}")
-    if memories.get("knowledge"):
-        context_parts.append(f"\n# 项目知识\n{memories['knowledge']}")
-    if memories.get("episodic"):
-        context_parts.append(f"\n# 相关经验\n{memories['episodic']}")
-
-    context = "\n\n".join(context_parts)
-
-    # 3. 添加到 SessionContext
-    session.add_message(Message(role="user", content=context))
-
-    # 4. 检查容量，必要时压缩
-    if session.should_compact():
-        session.compact(keep_recent=5)
-
-    # 5. LLM 推理
-    messages = session.get_messages_for_llm()
-    response = await get_model().think(messages)
-
-    # 6. 保存回复
-    session.add_message(Message(role="assistant", content=response))
-
-    return {"session": session, "task": response}
-
-# 节点 2: 判断是否需要分解
-async def should_decompose_node(state: LeadGraphState) -> str:
-    """判断是否需要分解任务"""
-    complexity = await get_model().with_structured_output(
-        ComplexityResult,
-        prompt=f"任务: {state['task']}\n\n判断是否需要分解..."
-    )
-    return "decompose" if complexity.should_decompose else "execute"
-
-# 节点 3: 分解任务
-async def decompose_node(state: LeadGraphState) -> LeadGraphState:
-    """分解任务（结构化输出 + 重试）"""
-    for attempt in range(3):
-        try:
-            result = await get_model().with_structured_output(
-                DecompositionResult,
-                prompt=f"任务: {state['task']}\n\n请分解..."
-            )
-            tasks = build_tasks(result.subtasks)
-            return {"subtasks": tasks, "should_decompose": True}
-        except ValidationError:
-            continue
-    return {"subtasks": [Task(description=state["task"])]}
-
-# 节点 4: ReAct 执行（复用 react.py）
-def build_react_subgraph():
-    """构建 ReAct 子图 - 复用 core/agent/react.py"""
-    from core.agent.react import build_react_graph
-    return build_react_graph()
-
-# 节点 5: 分配子任务
-async def assign_tasks_node(state: LeadGraphState) -> LeadGraphState:
-    """分配子任务给 Workers"""
-    assignments = {}
-    for task in state["subtasks"]:
-        worker_id = await get_team_manager().assign_task(task)
-        assignments[task.id] = worker_id
-    return {"assignments": assignments}
-
-# 节点 6: 汇总结果
-async def aggregate_node(state: LeadGraphState) -> LeadGraphState:
-    """汇总 Worker 结果"""
-    combined = "\n".join(r.result for r in state["results"].values() if r.success)
-    response = await get_model().think(f"合并结果并生成回复:\n{combined}")
-    return {"final_response": response}
-```
-
-### 5.3 构建图
-
-```python
-from langgraph.graph import StateGraph, END
-
-def build_lead_graph() -> CompiledGraph:
-    """构建 Lead Agent 执行图"""
-
-    builder = StateGraph(LeadGraphState)
-
-    builder.add_node("understand", understand_node)
-    builder.add_node("should_decompose", should_decompose_node)
-    builder.add_node("decompose", decompose_node)
-    builder.add_node("execute_direct", execute_direct_node)
-    builder.add_node("assign_tasks", assign_tasks_node)
-    builder.add_node("aggregate", aggregate_node)
-
-    builder.add_edge("understand", "should_decompose")
-
-    # 条件边
-    builder.add_conditional_edges(
-        "should_decompose",
-        lambda state: "decompose" if state["should_decompose"] else "execute"
-    )
-
-    builder.add_edge("decompose", "assign_tasks")
-    builder.add_edge("execute_direct", "aggregate")
-    builder.add_edge("assign_tasks", "aggregate")
-    builder.add_edge("aggregate", END)
-
-    return builder.compile()
-```
-
-### 5.4 ReAct 子图
-
-ReAct 子图是 Lead Agent 和 Worker Agent 共用的工具调用循环。
-
-详见：[react.md](react.md)（完整实现、容量管理、与 Worker 集成说明）
-
-```
-Lead Agent 和 Worker Agent 共用同一个 ReAct 子图：
-
-┌──────────────────────────────────────────────────────────┐
-│                     SessionContext                       │
-│  ┌──────────────────────────────────────────────────┐  │
-│  │ messages: [...] │ capacity 管理 │ compact()     │  │
-│  └──────────────────────────────────────────────────┘  │
-└──────────────────────────────────────────────────────────┘
-                           │
-          ┌────────────────┼────────────────┐
-          ▼                ▼                ▼
-  ┌────────────┐    ┌────────────┐    ┌────────────┐
-  │   Agent   │───►│   Tools   │───►│   观察     │
-  │  (记忆+   │    │ (ToolReg)  │    │ (存到      │
-  │  tool_res)│    │            │    │ tool_res)  │
-  └────────────┘    └────────────┘    └─────┬─────┘
-       ▲                                   │
-       └───────────────────────────────────┘
-                   (循环直到无工具调用)
-```
-
-**复用场景**：
-- Lead Agent：简单任务直接执行（不分解）
-- Worker Agent：执行子任务
-
-### 5.5 执行流程图
+### 5.3 执行流程图
 
 ```
                     用户输入
@@ -435,9 +224,41 @@ Lead Agent 和 Worker Agent 共用同一个 ReAct 子图：
                       END
 ```
 
+### 5.4 ReAct 子图
+
+`execute_direct_node` 调用 ReAct 子图处理简单任务。
+
+详见：[react.md](react.md)
+
+```
+Lead Agent 和 Worker Agent 共用同一个 ReAct 子图：
+
+┌──────────────────────────────────────────────────────────┐
+│                     SessionContext                       │
+│  ┌──────────────────────────────────────────────────┐  │
+│  │ messages: [...] │ capacity 管理 │ compact()     │  │
+│  └──────────────────────────────────────────────────┘  │
+└──────────────────────────────────────────────────────────┘
+                           │
+          ┌────────────────┼────────────────┐
+          ▼                ▼                ▼
+  ┌────────────┐    ┌────────────┐    ┌────────────┐
+  │   Agent   │───►│   Tools   │───►│   观察     │
+  │  (记忆+   │    │ (ToolReg)  │    │ (存到      │
+  │  tool_res)│    │            │    │ tool_res)  │
+  └────────────┘    └────────────┘    └─────┬─────┘
+       ▲                                   │
+       └───────────────────────────────────┘
+                   (循环直到无工具调用)
+```
+
+**复用场景**：
+- Lead Agent：`execute_direct_node` 调用 ReAct 执行简单任务
+- Worker Agent：执行子任务
+
 ---
 
-## 6. 与其他模块集成
+## 5. 与其他模块集成
 
 ### 6.1 与 Skill 集成
 
@@ -460,7 +281,27 @@ class LeadAgent:
 
 ### 6.2 与 Team Manager 集成
 
-Lead Agent 通过 Team Manager 分配任务给 Workers：
+Lead Agent 通过 Team Manager（位于 `core/team/manager.py`）分配任务给 Workers：
+
+```python
+from core.team.manager import TeamManager
+
+async def assign_tasks_to_workers(self, subtasks: list[Task]) -> dict[str, str]:
+    """分配子任务给 Workers"""
+    team_manager = TeamManager()
+    assignments = {}
+    for task in subtasks:
+        worker_id = await team_manager.assign_task(task)
+        assignments[task.id] = worker_id
+
+    # 注册完成回调
+    for task_id, worker_id in assignments.items():
+        team_manager.on_task_completed(
+            task_id=task_id,
+            callback=lambda result: self.handle_worker_result(result)
+        )
+    return assignments
+```
 
 ```
 Lead Agent ──assign_task()──> Team Manager ──dispatch──> Workers
@@ -468,15 +309,251 @@ Lead Agent ──assign_task()──> Team Manager ──dispatch──> Workers
                            <──on_task_completed()──
 ```
 
+详见：[../team/index.md](../team/index.md)
+
 ---
 
-## 7. 关键设计决策
+## 6. 关键设计决策
 
 | 决策项        | 选择     | 说明                   |
 | ------------- | -------- | ---------------------- |
 | 使用 LLM 分解 | 动态决定 | 根据任务特点自适应分解 |
 | Lead 负责汇总 | 集中管理 | 统一生成最终回复       |
 | 与 Skill 集成 | 技能匹配 | 任务开始时匹配相关技能 |
+| 与 Evolution 集成 | 后台通知 | 任务完成后通知进化引擎 |
+
+---
+
+## 7. 完整源码
+
+```python
+"""
+Lead Agent - 核心执行单元
+负责理解意图、智能分解任务、分配 Workers、汇总结果
+"""
+
+import time
+import logging
+from typing import Optional, TypedDict
+
+from langgraph.graph import StateGraph, END
+
+from core.agent.base import (
+    Task, TaskStatus, TaskResult,
+    SubTask, DecompositionResult, ComplexityResult
+)
+from core.memory import get_memory_layer
+from core.session import SessionContext, Message
+from core.team.manager import TeamManager
+from core.evolution.engine import EvolutionEngine
+from infra.model import get_model
+
+logger = logging.getLogger(__name__)
+
+
+class LeadGraphState(TypedDict):
+    """Lead Agent 执行图状态"""
+    session: SessionContext
+    task: Optional[str]
+    should_decompose: bool
+    subtasks: list[Task]
+    assignments: dict[str, str]
+    results: dict[str, TaskResult]
+    final_response: Optional[str]
+
+
+# ============ 节点实现 ============
+
+async def understand_node(state: LeadGraphState) -> LeadGraphState:
+    """节点1: 理解用户意图"""
+    memory = get_memory_layer()
+    session = state["session"]
+    user_input = state.get("messages", [{}])[-1].get("content", "")
+
+    memories = memory.retrieve(user_input)
+
+    context_parts = [f"# 用户输入\n{user_input}"]
+    if memories.get("preference"):
+        context_parts.append(f"\n# 用户偏好\n{memories['preference']}")
+    if memories.get("knowledge"):
+        context_parts.append(f"\n# 项目知识\n{memories['knowledge']}")
+    if memories.get("episodic"):
+        context_parts.append(f"\n# 相关经验\n{memories['episodic']}")
+
+    context = "\n\n".join(context_parts)
+
+    session.add_message(Message(role="user", content=context))
+
+    if session.should_compact():
+        session.compact(keep_recent=5)
+
+    messages = session.get_messages_for_llm()
+    response = await get_model().think(messages)
+
+    session.add_message(Message(role="assistant", content=response))
+
+    return {"session": session, "task": response}
+
+
+async def should_decompose_node(state: LeadGraphState) -> str:
+    """节点2: 判断是否需要分解"""
+    task = state.get("task", "")
+    complexity = await get_model().with_structured_output(
+        ComplexityResult,
+        prompt=f"任务: {task}\n\n判断是否需要分解..."
+    )
+    return "decompose" if complexity.should_decompose else "execute_direct"
+
+
+async def decompose_node(state: LeadGraphState) -> LeadGraphState:
+    """节点3: 分解任务"""
+    task = state.get("task", "")
+
+    for attempt in range(3):
+        try:
+            result = await get_model().with_structured_output(
+                DecompositionResult,
+                prompt=f"任务: {task}\n\n请分解..."
+            )
+
+            if not result.should_decompose:
+                return {"subtasks": [Task(description=task)], "should_decompose": False}
+
+            tasks = _build_tasks(result.subtasks)
+            return {"subtasks": tasks, "should_decompose": True}
+
+        except Exception as e:
+            logger.warning(f"分解失败，重试 ({attempt + 1}/3): {e}")
+            continue
+
+    return {"subtasks": [Task(description=task)], "should_decompose": False}
+
+
+def _build_tasks(subtasks: list[SubTask]) -> list[Task]:
+    """构建 Task 对象"""
+    tasks = []
+    for i, st in enumerate(subtasks):
+        task = Task(
+            id=f"task_{i}",
+            description=st.description,
+            status=TaskStatus.PENDING,
+            created_at=time.time(),
+        )
+        for dep_id in st.dependencies:
+            task.children_ids.append(dep_id)
+        tasks.append(task)
+    return tasks
+
+
+async def execute_direct_node(state: LeadGraphState) -> LeadGraphState:
+    """节点4: 调用 ReAct 子图执行"""
+    from core.agent.react import build_react_graph
+
+    session = state["session"]
+    task = state.get("task", "")
+
+    react_graph = build_react_graph()
+    result = await react_graph.ainvoke({
+        "messages": session.get_messages_for_llm(),
+        "task": task
+    })
+
+    return {"results": {"main": TaskResult(success=True, result=str(result))}}
+
+
+async def assign_tasks_node(state: LeadGraphState) -> LeadGraphState:
+    """节点5: 分配子任务"""
+    team_manager = TeamManager()
+    subtasks = state.get("subtasks", [])
+    assignments = {}
+
+    for task in subtasks:
+        worker_id = await team_manager.assign_task(task)
+        assignments[task.id] = worker_id
+
+    return {"assignments": assignments}
+
+
+async def aggregate_node(state: LeadGraphState) -> LeadGraphState:
+    """节点6: 汇总结果"""
+    results = state.get("results", {})
+    combined = "\n".join(r.result for r in results.values() if r.success)
+
+    response = await get_model().think(f"合并以下结果并生成最终回复:\n{combined}")
+
+    if combined:
+        await _trigger_evolution(state.get("task", ""), results, {"aggregated": response})
+
+    return {"final_response": response}
+
+
+async def _trigger_evolution(task: str, results: dict, context: dict):
+    """触发进化引擎"""
+    try:
+        evolution = EvolutionEngine()
+        await evolution.notify(
+            trigger="task_completed",
+            task=task,
+            results={k: v.result for k, v in results.items()},
+            context=context
+        )
+    except Exception as e:
+        logger.warning(f"触发进化失败: {e}")
+
+
+# ============ 构建图 ============
+
+def build_lead_graph():
+    """构建 Lead Agent 执行图"""
+    builder = StateGraph(LeadGraphState)
+
+    builder.add_node("understand", understand_node)
+    builder.add_node("should_decompose", should_decompose_node)
+    builder.add_node("decompose", decompose_node)
+    builder.add_node("execute_direct", execute_direct_node)
+    builder.add_node("assign_tasks", assign_tasks_node)
+    builder.add_node("aggregate", aggregate_node)
+
+    builder.add_edge("understand", "should_decompose")
+
+    builder.add_conditional_edges(
+        "should_decompose",
+        lambda state: "decompose" if state["should_decompose"] else "execute_direct"
+    )
+
+    builder.add_edge("decompose", "assign_tasks")
+    builder.add_edge("execute_direct", "aggregate")
+    builder.add_edge("assign_tasks", "aggregate")
+    builder.add_edge("aggregate", END)
+
+    return builder.compile()
+
+
+# ============ 入口类 ============
+
+class LeadAgent:
+    """Lead Agent 主入口"""
+
+    def __init__(self):
+        self.memory = get_memory_layer()
+        self.llm = get_model()
+        self.team_manager = TeamManager()
+        self.graph = build_lead_graph()
+
+    async def run(self, user_input: str, session: SessionContext) -> str:
+        """执行主流程"""
+        result = await self.graph.ainvoke({
+            "session": session,
+            "messages": [{"role": "user", "content": user_input}],
+            "task": None,
+            "should_decompose": False,
+            "subtasks": [],
+            "assignments": {},
+            "results": {},
+            "final_response": None
+        })
+        return result.get("final_response", "")
+```
 
 ---
 
