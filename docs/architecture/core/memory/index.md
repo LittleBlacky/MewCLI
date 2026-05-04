@@ -27,7 +27,7 @@ core/memory/
 ├── preference.py            # 用户偏好层
 ├── knowledge.py             # 项目知识层
 ├── episodic.py              # 事件记忆层
-├── dream.py                 # 梦境整合层（Dream Consolidator）
+├── dream.py                 # 梦境整合层
 └── layer.py                 # 记忆层整合
 ```
 
@@ -39,21 +39,32 @@ core/memory/
 |------|------|------|
 | **分层设计** | 三层记忆各有职责 | 便于管理 |
 | **Markdown 存储** | 便于阅读和编辑 | 用户友好 |
-| **按需检索** | 只在需要时检索 | 节省资源 |
-| **自动注入** | 自动注入相关记忆 | 提高效率 |
+| **LLM 检索** | 语义理解用户意图 | 智能匹配 |
+| **直接读取** | Preference/Knowledge 量少，直接获取 | 节省资源 |
 | **梦境整合** | 会话间隙自动整合记忆 | 去重优化 |
 
 ---
 
 ## 三层记忆职责
 
-| 层级 | 职责 | 生命周期 | 注入时机 |
-|------|------|----------|----------|
-| **Preference** | 用户偏好 | 长期 | 每次会话开始 |
-| **Knowledge** | 项目知识 | 长期 | 会话开始 + 按需 |
-| **Episodic** | 事件记忆 | 短期 | 按需检索 |
+| 层级 | 职责 | 操作 | 检索方式 |
+|------|------|------|----------|
+| **Preference** | 用户偏好 | save/get/update/delete/list | 直接获取 |
+| **Knowledge** | 项目知识 | save/get/update/delete/list | 直接获取 |
+| **Episodic** | 事件记忆 | save/get/delete/search/consolidate | LLM 检索 |
 
-> **Dream 梦境整合**不是一个存储层，而是控制层，负责监控和整合以上三层记忆，在会话间隙自动触发。
+---
+
+## 操作总览
+
+| 操作 | Preference | Knowledge | Episodic |
+|------|-----------|-----------|----------|
+| **存入** | ✅ save | ✅ save | ✅ save |
+| **读取** | ✅ get/get_all | ✅ get/get_all | ✅ get/get_all |
+| **检索** | ❌ | ❌ | ✅ search（LLM） |
+| **更新** | ✅ update | ✅ update | ❌ 很少更新 |
+| **删除** | ✅ delete | ✅ delete | ✅ delete |
+| **整合** | ❌ | ❌ | ✅ consolidate（Dream） |
 
 ---
 
@@ -61,16 +72,32 @@ core/memory/
 
 ```
 .minicode/
-└── memory/                  # 记忆存储目录
-    ├── static/                  # 静态记忆
-    │   ├── preferences.md      # 用户偏好
-    │   └── project.md           # 项目知识
-    ├── session/                # 会话记忆
-    │   └── session_{thread_id}.json
+└── memory/
+    ├── static/
+    │   ├── preferences.md     # 用户偏好
+    │   └── project.md         # 项目知识
     ├── episodic/              # 事件记忆
     │   ├── episode_xxx.md
     │   └── ...
-    └── .dream_lock           # 梦境整合锁（防止并发）
+    └── .dream_lock           # 梦境整合锁
+```
+
+---
+
+## 检索流程
+
+```
+用户输入
+    │
+    ▼
+Preference → 直接获取（量少）
+    │
+Knowledge → 直接获取（量少）
+    │
+Episodic → LLM 语义检索（量大）
+    │
+    ▼
+返回相关记忆
 ```
 
 ---

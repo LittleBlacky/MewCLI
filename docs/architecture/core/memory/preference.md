@@ -11,12 +11,12 @@
 Preference 层负责存储和管理用户偏好：
 
 1. **长期存储** - 用户偏好持久化存储
-2. **自动注入** - 会话开始时自动注入
+2. **直接读取** - 会话开始时直接注入
 3. **按需更新** - 支持运行时更新偏好
 
 ---
 
-## 2. PreferenceMemory 实现
+## 2. 操作列表
 
 ```python
 class PreferenceMemory:
@@ -26,19 +26,121 @@ class PreferenceMemory:
         self.storage_dir = storage_dir / "static"
         self.preferences_file = self.storage_dir / "preferences.md"
 
-    def save_preference(self, key: str, value: str) -> None:
-        """保存偏好"""
+    # ============ 基础操作 ============
 
-    def get_preferences(self) -> str:
-        """获取偏好，返回格式化文本"""
+    def save(self, key: str, value: str) -> None:
+        """存入/更新偏好"""
 
-    def list_preferences(self) -> list[dict]:
+    def get(self, key: str) -> Optional[str]:
+        """读取单个偏好"""
+
+    def get_all(self) -> str:
+        """读取全部偏好（格式化）"""
+
+    def update(self, key: str, value: str) -> None:
+        """更新偏好（等同于 save）"""
+
+    def delete(self, key: str) -> None:
+        """删除偏好"""
+
+    def list_all(self) -> list[dict]:
         """列出所有偏好"""
 ```
 
 ---
 
-## 3. 存储格式（Markdown）
+## 3. 存入（save）
+
+```python
+def save(self, key: str, value: str) -> None:
+    """存入/更新偏好"""
+    preferences = self._load_preferences()
+    preferences[key] = value
+    self._save_preferences(preferences)
+
+
+def _load_preferences(self) -> dict[str, str]:
+    """加载偏好文件"""
+    if not self.preferences_file.exists():
+        return {}
+    content = self.preferences_file.read_text()
+    # 解析 markdown 格式：key: value
+    preferences = {}
+    for line in content.split("\n"):
+        if ":" in line:
+            key, value = line.split(":", 1)
+            preferences[key.strip()] = value.strip()
+    return preferences
+
+
+def _save_preferences(self, preferences: dict[str, str]) -> None:
+    """保存偏好文件"""
+    lines = ["# 用户偏好"]
+    for key, value in preferences.items():
+        lines.append(f"{key}: {value}")
+    self.preferences_file.write_text("\n".join(lines))
+```
+
+**触发时机**：
+- 用户设置偏好（如 `set tab_size=4`）
+- Evolution 进化出新的偏好
+
+---
+
+## 4. 读取（get / get_all）
+
+```python
+def get(self, key: str) -> Optional[str]:
+    """读取单个偏好"""
+    preferences = self._load_preferences()
+    return preferences.get(key)
+
+
+def get_all(self) -> str:
+    """读取全部偏好（格式化，供上下文使用）"""
+    if not self.preferences_file.exists():
+        return ""
+    return self.preferences_file.read_text()
+```
+
+---
+
+## 5. 更新（update）
+
+```python
+def update(self, key: str, value: str) -> None:
+    """更新偏好"""
+    # 等同于 save
+    self.save(key, value)
+```
+
+---
+
+## 6. 删除（delete）
+
+```python
+def delete(self, key: str) -> None:
+    """删除偏好"""
+    preferences = self._load_preferences()
+    if key in preferences:
+        del preferences[key]
+        self._save_preferences(preferences)
+```
+
+---
+
+## 7. 列出（list_all）
+
+```python
+def list_all(self) -> list[dict]:
+    """列出所有偏好"""
+    preferences = self._load_preferences()
+    return [{"key": k, "value": v} for k, v in preferences.items()]
+```
+
+---
+
+## 8. 存储格式（Markdown）
 
 ```markdown
 # 用户偏好
@@ -51,33 +153,30 @@ permission_mode: prompt
 
 ---
 
-## 4. 与 Lead Agent 集成
+## 9. 与其他模块集成
 
 ```python
 class LeadAgent:
     def __init__(self, memory_layer: MemoryLayer):
         self.memory = memory_layer
 
-    def build_context(self, user_input: str, memories: dict) -> str:
-        """构建包含记忆的上下文"""
-        parts = [f"用户输入: {user_input}"]
+    async def build_system_prompt(self) -> str:
+        """构建 System Prompt"""
+        preferences = self.memory.preference.get_all()
 
-        # 添加偏好
-        if memories.get("preference"):
-            parts.append(f"\n\n# 用户偏好\n{memories['preference']}")
+        return f"""你是 AI 助手。
 
-        return "\n\n".join(parts)
+# 用户偏好
+{preferences}
+
+---
+现在开始对话...
+"""
 ```
 
 ---
 
-## 5. 注入时机
-
-Preference 层在会话开始时自动注入到 System Prompt。
-
----
-
-## 6. 相关文档
+## 10. 相关文档
 
 - [index.md](index.md) - 记忆架构索引
 - [knowledge.md](knowledge.md) - Knowledge 知识层
